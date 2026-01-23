@@ -5,12 +5,20 @@ import triton
 import triton.language as tl
 
 from fla.ops.utils import prepare_chunk_indices, prepare_chunk_offsets
-from fla.ops.utils.op import exp
+from fla.ops.utils.op import exp, exp2
 from fla.utils import IS_NVIDIA_HOPPER, USE_CUDA_GRAPH, autotune_cache_kwargs, check_shared_mem
 
 NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8, 16]
 
 
+@triton.heuristics({
+    'USE_G': lambda args: args['g'] is not None,
+    'USE_GK': lambda args: args['gk'] is not None,
+    'USE_INITIAL_STATE': lambda args: args['h0'] is not None,
+    'STORE_FINAL_STATE': lambda args: args['ht'] is not None,
+    'SAVE_NEW_VALUE': lambda args: args['v_new'] is not None,
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+})
 # @triton.autotune(
 #     configs=[
 #         triton.Config({'BV': BV}, num_warps=num_warps, num_stages=num_stages)
@@ -20,16 +28,8 @@ NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8, 16]
 #     ],
 #     key=['H', 'K', 'V', 'BT', 'USE_EXP2'],
 #     use_cuda_graph=USE_CUDA_GRAPH,
-#     # **autotune_cache_kwargs,
+#     **autotune_cache_kwargs,
 # )
-@triton.heuristics({
-    'USE_G': lambda args: args['g'] is not None,
-    'USE_GK': lambda args: args['gk'] is not None,
-    'USE_INITIAL_STATE': lambda args: args['h0'] is not None,
-    'STORE_FINAL_STATE': lambda args: args['ht'] is not None,
-    'SAVE_NEW_VALUE': lambda args: args['v_new'] is not None,
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
-})
 @triton.jit
 def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     k,
@@ -86,7 +86,8 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         boh = tl.load(chunk_offsets + i_n).to(tl.int32)
     else:
         bos, eos = i_n * T, i_n * T + T
-        # NT is passed as argument
+        # NT = tl.cdiv(T, BT)
+        # NT = int((T + BT - 1) // BT)
         boh = i_n * NT
 
     # [BK, BV]
@@ -267,7 +268,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     ],
     key=['H', 'K', 'V', 'BT', 'BV', 'USE_G', 'USE_EXP2'],
     use_cuda_graph=USE_CUDA_GRAPH,
-    # **autotune_cache_kwargs,
+    **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
 def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
@@ -307,7 +308,7 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
         boh = tl.load(chunk_offsets + i_n).to(tl.int32)
     else:
         bos, eos = i_n * T, i_n * T + T
-        NT = int((T + BT - 1) // BT)
+        NT = tl.cdiv(T, BT)
         boh = i_n * NT
 
     # [BK, BV]
@@ -367,8 +368,8 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
             p_g = tl.make_block_ptr(g + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
             b_g = tl.load(p_g, boundary_check=(0,)).to(tl.float32)
             if USE_EXP2:
-                bg_last_exp = tl.math.exp2(bg_last)
-                b_g_exp = tl.math.exp2(b_g)
+                bg_last_exp = exp2(bg_last)
+                b_g_exp = exp2(b_g)
             else:
                 bg_last_exp = exp(bg_last)
                 b_g_exp = exp(b_g)
@@ -414,7 +415,7 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
         if USE_G:
             m_t = (i_t * BT + tl.arange(0, BT)) < T
             if USE_EXP2:
-                b_dv *= tl.where(m_t, tl.math.exp2(bg_last - b_g), 0)[:, None]
+                b_dv *= tl.where(m_t, exp2(bg_last - b_g), 0)[:, None]
             else:
                 b_dv *= tl.where(m_t, exp(bg_last - b_g), 0)[:, None]
         b_dv += tl.load(p_dv, boundary_check=(0, 1))
@@ -430,7 +431,7 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
             b_q = b_q * b_g_exp[None, :]
         if USE_GK:
             if USE_EXP2:
-                b_dh1 *= tl.math.exp2(b_gk_last1[:, None])
+                b_dh1 *= exp2(b_gk_last1[:, None])
             else:
                 b_dh1 *= exp(b_gk_last1[:, None])
         b_dh1 += tl.dot(b_q.to(b_q.dtype), b_do.to(b_q.dtype)) * scale - tl.dot(b_w, b_dv.to(b_w.dtype))
@@ -444,7 +445,7 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
                 b_q = b_q * b_g_exp[None, :]
             if USE_GK:
                 if USE_EXP2:
-                    b_dh2 *= tl.math.exp2(b_gk_last2[:, None])
+                    b_dh2 *= exp2(b_gk_last2[:, None])
                 else:
                     b_dh2 *= exp(b_gk_last2[:, None])
             b_dh2 += tl.dot(b_q.to(b_q.dtype), b_do.to(b_q.dtype)) * scale - tl.dot(b_w, b_dv.to(b_w.dtype))
@@ -557,7 +558,8 @@ def chunk_gated_delta_rule_fwd_h(
     final_state = k.new_empty(N, H, K, V, dtype=torch.float32) if output_final_state else None
 
     v_new = torch.empty_like(u) if save_new_value else None
-    # Hardcode BV=64 to bypass autotuner issues
+
+    # for BV in [32, 64]
     BV = 64
     def grid(meta): return (triton.cdiv(V, BV), N*H)
     chunk_gated_delta_rule_fwd_kernel_h_blockdim64[grid](
