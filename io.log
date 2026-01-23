@@ -1,0 +1,16 @@
+E0122 23:12:54.830355  154843 cuda_timer.cc:87] Delay kernel timed out: measured time has sub-optimal accuracy. There may be a missing warmup execution, please investigate in Nsight Systems.
+Imports setup...
+JAX Default Backend: gpu
+JAX Devices: [CudaDevice(id=0)]
+Initializing Models...
+Transferring Weights from PyTorch to JAX...
+Running Forward Pass...
+attention mask shape None
+mode =  chunk
+PyTorch Output Shape: (2, 128, 256)
+JAX Output Shape:     (2, 128, 256)
+----------------------------------------
+Max Absolute Difference: 0.000612
+Mean Absolute Difference: 0.000083
+----------------------------------------
+SUCCESS: Results match closely!

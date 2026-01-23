@@ -1,0 +1,1 @@
+./scripts/sync_code.sh && sky exec $(cat .cluster_name) "cd delta_attention_comparison/ && PYTHONPATH=. uv run python tests/test_pallas_kda.py"

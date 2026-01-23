@@ -1,0 +1,48 @@
+name: Publish to PyPI
+
+on:
+  # Event manually triggered (in the Github UI)
+  workflow_dispatch:
+
+
+# This job will publish the package to PyPI. It will use the release
+# environment and OIDC tokens to publish the package via pypa-publish.
+# See https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments
+# and https://blog.pypi.org/posts/2023-04-20-introducing-trusted-publishers for more details.
+jobs:
+  pypi-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: release
+    permissions:
+      # IMPORTANT: this permission is mandatory for trusted publishing
+      id-token: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+    - name: Checkout Tokamax
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      with:
+        persist-credentials: false
+
+    - name: Install Python 3.12
+      uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c  # v6.0.0
+      with:
+        python-version: 3.12
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip --version
+        python -m pip install build
+        python -m pip install -e .[cuda,tpu,test]
+        python -m pip freeze
+
+    # Publish the package
+    - name: Build Tokamax
+      run: |
+        python -m build
+
+    - name: Publish package distributions to PyPI
+      uses: pypa/gh-action-pypi-publish@76f52bc884231f62b9a034ebfe128415bbaabdfc  # v1.12.4

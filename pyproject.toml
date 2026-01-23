@@ -1,0 +1,32 @@
+[project]
+name = "tpu-research"
+version = "0.1.0"
+authors = [
+  { name = "xinglong", email = "xinglong940713@gmail.com" },
+]
+description = "A collection of tpu experiments."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "jaxlib",
+    "flax",
+    "optax",
+    "numpy",
+    "matplotlib>=3.10.8",
+    "transformers",
+    "einops",
+]
+
+[project.optional-dependencies]
+tpu = [
+    "jax[tpu]; sys_platform == 'linux'",
+    "libtpu; sys_platform == 'linux'",
+]
+gpu = [
+    "torch",
+    "triton>=3.2.0",
+    "jax[cpu]",
+]
+
+[tool.uv]
+find-links = ["https://storage.googleapis.com/jax-releases/libtpu_releases.html"]

@@ -1,0 +1,15 @@
+# Launch TPU resources for development with SkyPilot command:
+#   sky launch tpu_resource.sky.yaml
+workdir: ./delta_attention_comparison/
+
+file_mounts:
+  ~/.ssh/id_ed25519: ~/.ssh/id_ed25519
+
+resources:
+  accelerators: $ACCELERATOR
+  accelerator_args:
+      tpu_vm: True
+      runtime_version: v2-alpha-tpuv6e
+  use_spot: True # The default instance is spot.
+
+setup: |
