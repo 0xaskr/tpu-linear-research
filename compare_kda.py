@@ -22,7 +22,11 @@ try:
     from fla.layers.kda import KimiDeltaAttention as TorchKDA
     # Fix for relative imports in JAX implementation:
     # We need 'src' to be importable as a top-level module
-    from src.layers.kimi_delta_attention import KimiDeltaAttention as JaxKDA
+    # Try importing from delta_attention_comparison.layers if src is not available
+    try:
+        from src.layers.kimi_delta_attention import KimiDeltaAttention as JaxKDA
+    except ImportError:
+        from layers.kimi_delta_attention import KimiDeltaAttention as JaxKDA
 except ImportError as e:
     print(f"Import failed: {e}")
     # Try to verify path
@@ -58,7 +62,7 @@ torch_model = TorchKDA(
     use_short_conv=True,
     conv_size=4,
     conv_bias=False
-).to(device)
+).to(device).to(torch.bfloat16)
 torch_model.eval()
 
 # JAX Model
@@ -70,7 +74,7 @@ jax_model = JaxKDA(
     num_v_heads=NUM_HEADS,
     conv_kernel_size=4,
     normalization_layer_epsilon=1e-5,
-    dtype=jnp.float32,
+    dtype=jnp.bfloat16,
     rngs=rngs,
 )
 
@@ -80,21 +84,21 @@ print("Transferring Weights from PyTorch to JAX...")
 
 def copy_linear(pt_linear, jax_dense):
     # PT: (out, in). JAX: (in, out)
-    w = pt_linear.weight.detach().cpu().numpy()
-    jax_dense.kernel.value = jnp.array(w.T)
+    w = pt_linear.weight.detach().cpu().to(torch.float32).numpy()
+    jax_dense.kernel.value = jnp.array(w.T, dtype=jnp.bfloat16)
     if pt_linear.bias is not None:
-        b = pt_linear.bias.detach().cpu().numpy()
-        jax_dense.bias.value = jnp.array(b)
+        b = pt_linear.bias.detach().cpu().to(torch.float32).numpy()
+        jax_dense.bias.value = jnp.array(b, dtype=jnp.bfloat16)
 
 def copy_conv(pt_conv, jax_conv):
     # PT: (D, 1, K). JAX: (K, 1, D) for depthwise
-    w = pt_conv.weight.detach().cpu().numpy() # (D, 1, K)
+    w = pt_conv.weight.detach().cpu().to(torch.float32).numpy() # (D, 1, K)
     # Target: (K, 1, D) -> Permute (2, 1, 0)
     w_jax = np.transpose(w, (2, 1, 0))
-    jax_conv.kernel.value = jnp.array(w_jax)
+    jax_conv.kernel.value = jnp.array(w_jax, dtype=jnp.bfloat16)
     if pt_conv.bias is not None:
-        b = pt_conv.bias.detach().cpu().numpy()
-        jax_conv.bias.value = jnp.array(b)
+        b = pt_conv.bias.detach().cpu().to(torch.float32).numpy()
+        jax_conv.bias.value = jnp.array(b, dtype=jnp.bfloat16)
 
 # Projections
 copy_linear(torch_model.q_proj, jax_model.q_proj)
@@ -122,21 +126,21 @@ copy_linear(torch_model.b_proj, jax_model.b_proj)
 # Parameters
 # A_log
 # PT: (H). JAX: (1, 1, H, 1)
-a_log_pt = torch_model.A_log.detach().cpu().numpy()
-jax_model.A_log.value = jnp.array(a_log_pt.reshape(1, 1, NUM_HEADS, 1))
+a_log_pt = torch_model.A_log.detach().cpu().to(torch.float32).numpy()
+jax_model.A_log.value = jnp.array(a_log_pt.reshape(1, 1, NUM_HEADS, 1), dtype=jnp.bfloat16)
 
 # dt_bias
 # PT: (D). JAX: (D)
-dt_bias_pt = torch_model.dt_bias.detach().cpu().numpy()
-jax_model.dt_bias.value = jnp.array(dt_bias_pt)
+dt_bias_pt = torch_model.dt_bias.detach().cpu().to(torch.float32).numpy()
+jax_model.dt_bias.value = jnp.array(dt_bias_pt, dtype=jnp.bfloat16)
 
     
 # Output Norm (FusedRMSNormGated)
 # PT: o_norm.weight -> JAX: o_norm.rms_norm.scale
 # Note: PT's FusedRMSNormGated usually inherits from RMSNorm or implements it similarly.
 # Let's check if it has 'weight' or 'scale'. Usually 'weight'.
-norm_weight = torch_model.o_norm.weight.detach().cpu().numpy()
-jax_model.o_norm.rms_norm.scale.value = jnp.array(norm_weight)
+norm_weight = torch_model.o_norm.weight.detach().cpu().to(torch.float32).numpy()
+jax_model.o_norm.rms_norm.scale.value = jnp.array(norm_weight, dtype=jnp.bfloat16)
 
 
 # 5. Run Comparison
@@ -148,17 +152,17 @@ np.random.seed(42)
 x_np = np.random.randn(BATCH_SIZE, SEQ_LEN, HIDDEN_SIZE).astype(np.float32)
 
 # PyTorch Run
-x_pt = torch.tensor(x_np, device=device)
+x_pt = torch.tensor(x_np, device=device, dtype=torch.bfloat16)
 with torch.no_grad():
     y_pt, _, _ = torch_model(x_pt)
-    y_pt_np = y_pt.cpu().numpy()
+    y_pt_np = y_pt.float().cpu().numpy()
 
 # JAX Run
-x_jax = jnp.array(x_np)
+x_jax = jnp.array(x_np, dtype=jnp.bfloat16)
 # JAX Call: (hidden_states, chunk_size, ...)
 # Note: output is (output, final_state, past_key_values)
 y_jax, _, _ = jax_model(x_jax, chunk_size=CHUNK_SIZE)
-y_jax_np = np.array(y_jax)
+y_jax_np = np.array(y_jax, dtype=np.float32)
 
 # 6. Analysis
 # -----------------------------------------------------------------------------
@@ -174,7 +178,7 @@ print(f"Max Absolute Difference: {max_diff:.6f}")
 print(f"Mean Absolute Difference: {mean_diff:.6f}")
 print("-" * 40)
 
-if max_diff < 1e-3:
+if max_diff < 1e-4:
     print("SUCCESS: Results match closely!")
 else:
     print("WARNING: Results diverge!")

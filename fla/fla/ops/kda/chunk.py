@@ -55,6 +55,16 @@ def chunk_kda_fwd(
     # 使用 Delta Rule 跨 chunk 更新循环状态 (RNN state)。
     # h: history state after each chunk / 每个 chunk 之后的历史状态
     # v_new: updated values after applying the delta rule / 应用 delta rule 更新后的 value (v - correction)
+    
+    print("kg_shape = ", kg.shape)  # [2, 128, 4, 64]
+    print("k.shape = ", k.shape)    # [2, 128, 4, 64]
+    print("w.shape = ", w.shape)    # [2, 128, 4, 64]
+    print("u.shape = ", u.shape)    # [2, 128, 4, 64]
+    print("g.shape = ", g.shape)    # [2, 128, 4, 64]
+    print("initial_state shape = ", initial_state.shape if initial_state is not None else None) # None
+    print("output_final_state = ", output_final_state)  # false
+    print("cu_seqlens = ", cu_seqlens)  # None
+    print("chink_indices = ", chunk_indices)  # None
     h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
         k=kg,
         w=w,
@@ -66,6 +76,10 @@ def chunk_kda_fwd(
         chunk_indices=chunk_indices,
         use_exp2=True,
     )
+    print("h.shape = ", h.shape)
+    print("v_new shape = ", v_new.shape)
+    print("final_state shape = ", final_state.shape if final_state is not None else None)
+
 
     # 3. Output Computation / 输出计算
     # Compute the final output by combining local attention and historical state.
