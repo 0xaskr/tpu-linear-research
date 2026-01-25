@@ -86,7 +86,7 @@ def chunk_gated_delta_rule_fwd_pallas_kernel(
         ht_ptr[0, i_h, :, :] = b_h.astype(ht_ptr.dtype)
 
 def chunk_gated_delta_rule_fwd_h_jax(
-    k, w, u, g=None, gk=None, initial_state=None,
+    k : jax.Array, w: jax.Array, u: jax.Array, g: Optional[jax.Array]=None, gk: Optional[jax.Array]=None, initial_state: Optional[jax.Array]=None,
     output_final_state=False, chunk_size=64, save_new_value=True, use_exp2=False
 ):
     # Inputs: [B, T, H, K]

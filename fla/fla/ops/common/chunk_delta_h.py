@@ -79,16 +79,11 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     """
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
-    if IS_VARLEN:
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
-        T = eos - bos
-        NT = tl.cdiv(T, BT)
-        boh = tl.load(chunk_offsets + i_n).to(tl.int32)
-    else:
-        bos, eos = i_n * T, i_n * T + T
-        # NT = tl.cdiv(T, BT)
-        # NT = int((T + BT - 1) // BT)
-        boh = i_n * NT
+    
+    bos, eos = i_n * T, i_n * T + T
+    # NT = tl.cdiv(T, BT)
+    # NT = int((T + BT - 1) // BT)
+    boh = i_n * NT
 
     # [BK, BV]
     b_h1 = tl.zeros([64, BV], dtype=tl.float32)
@@ -545,23 +540,24 @@ def chunk_gated_delta_rule_fwd_h(
     B, T, H, K, V = *k.shape, u.shape[-1]
     BT = chunk_size
 
-    if chunk_indices is None and cu_seqlens is not None:
-        chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
-    # N: the actual number of sequences in the batch with either equal or variable lengths
-    if cu_seqlens is None:
-        N, NT, chunk_offsets = B, triton.cdiv(T, BT), None
-    else:
-        N, NT, chunk_offsets = len(cu_seqlens) - 1, len(chunk_indices), prepare_chunk_offsets(cu_seqlens, BT)
-    assert K <= 256, "current kernel does not support head dimension larger than 256."
+    NT = triton.cdiv(T, BT)
 
+    assert K <= 256, "current kernel does not support head dimension larger than 256."
+    
+    # h 代表了 chunk内 局部的状态
     h = k.new_empty(B, NT, H, K, V)
-    final_state = k.new_empty(N, H, K, V, dtype=torch.float32) if output_final_state else None
+
+    final_state = k.new_empty(B, H, K, V, dtype=torch.float32) if output_final_state else None
 
     v_new = torch.empty_like(u) if save_new_value else None
 
     # for BV in [32, 64]
+    # chunk 内部的大小 ？
     BV = 64
-    def grid(meta): return (triton.cdiv(V, BV), N*H)
+    def grid(meta): return (triton.cdiv(V, BV), B * H)
+    print("BH = ", B*H)
+    print("BV = ", BV)
+    # [B, T, H, K]
     chunk_gated_delta_rule_fwd_kernel_h_blockdim64[grid](
         k=k,
         v=u,
@@ -572,16 +568,16 @@ def chunk_gated_delta_rule_fwd_h(
         h=h,
         h0=initial_state,
         ht=final_state,
-        cu_seqlens=cu_seqlens,
-        chunk_offsets=chunk_offsets,
-        T=T,
-        NT=NT,
-        H=H,
-        K=K,
-        V=V,
-        BT=BT,
-        BV=BV,
-        USE_EXP2=use_exp2,
+        cu_seqlens=None,
+        chunk_offsets=None,
+        T=T,    # tl.constexpr
+        NT=NT,  # tl.constexpr
+        H=H,    # tl.constexpr
+        K=K,    # tl.constexpr
+        V=V,    # tl.constexpr
+        BT=BT,  # tl.constexpr
+        BV=BV,  # tl.constexpr
+        USE_EXP2=use_exp2,  # tl.constexpr
     )
     return h, v_new, final_state
 
