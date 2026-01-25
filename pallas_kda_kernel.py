@@ -117,7 +117,7 @@ def chunk_gated_delta_rule_fwd_h_jax(
     res_h = jnp.empty((B, H, NT, K, V), dtype=k.dtype)
     res_v_new = jnp.empty((B, H, T, V), dtype=u.dtype)
     res_ht = jnp.empty((B, H, K, V), dtype=jnp.float32)
-
+    
     def kernel_wrapper(k_p, v_p, w_p, g_p, gk_p, h0_p, h_p, v_new_p, ht_p):
         chunk_gated_delta_rule_fwd_pallas_kernel(
             k_p, v_p, w_p, g_p, gk_p, h0_p,

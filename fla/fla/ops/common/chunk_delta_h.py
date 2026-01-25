@@ -32,25 +32,25 @@ NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8, 16]
 # )
 @triton.jit
 def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
-    k,
-    v,
-    w,
-    v_new,
-    g,
-    gk,
-    h,
-    h0,
-    ht,
+    k,  # ptr [B, T, H, K]
+    v,  # ptr [B, T, H, V]
+    w,  # ptr [B, T, H, K]
+    v_new,  # ptr [B, T, H, V]
+    g,  # ptr [B, T, H]
+    gk, # ptr [B, T, H, K]
+    h,  # ptr [B, NT, H, K, V]
+    h0, # ptr [B, H, K, V]
+    ht, # ptr [B, H, K, V]
     cu_seqlens,
     chunk_offsets,
-    T: tl.constexpr,
-    NT: tl.constexpr,
-    H: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BT: tl.constexpr,
-    BV: tl.constexpr,
-    USE_G: tl.constexpr,
+    T: tl.constexpr,    # total_token_num
+    NT: tl.constexpr,   # total_chunk_num
+    H: tl.constexpr,    # head_num
+    K: tl.constexpr,    # d_size_per_head
+    V: tl.constexpr,    # value size
+    BT: tl.constexpr,   # chunk_size
+    BV: tl.constexpr,   # block value size
+    USE_G: tl.constexpr,  
     USE_GK: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
     STORE_FINAL_STATE: tl.constexpr,
@@ -77,13 +77,17 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     4. Decay: Apply g to h_prev and v_new.
     5. Update: h_curr = h_prev + k^T * v_new
     """
+    # k = [B, T, H, K]
+    # （BV, B * H）
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
     
-    bos, eos = i_n * T, i_n * T + T
+    # 多少个token 以后
+    bos = i_n * T
     # NT = tl.cdiv(T, BT)
     # NT = int((T + BT - 1) // BT)
     boh = i_n * NT
+    # 多少个chunk token以后
 
     # [BK, BV]
     b_h1 = tl.zeros([64, BV], dtype=tl.float32)
@@ -95,22 +99,26 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         b_h4 = tl.zeros([64, BV], dtype=tl.float32)
 
     # calculate offset
-    h += (boh * H + i_h).to(tl.int64) * K*V
-    v += (bos * H + i_h).to(tl.int64) * V
-    k += (bos * H + i_h).to(tl.int64) * K
-    w += (bos * H + i_h).to(tl.int64) * K
+    # Beginning of Sequence 不同的token, 起始
+    # Beginning of History  不同batc下的的histtory, 
+    (i_n * NT * H + i_h) * K * V
+    h = h[i_n,:,i_h:,:,:]
+    h += (boh * H + i_h).to(tl.int64) * K * V   # 在h中, 第多少个batch, 第多少个head
+    v += (bos * H + i_h).to(tl.int64) * V       # v中, 第多少个batch, 多少个head
+    k += (bos * H + i_h).to(tl.int64) * K       # k中, 第多少个batch, 多少个head
+    w += (bos * H + i_h).to(tl.int64) * K       # w中, 第多少个batch, 多少个head
     if SAVE_NEW_VALUE:
-        v_new += (bos * H + i_h).to(tl.int64) * V
+        v_new += (bos * H + i_h).to(tl.int64) * V   # v_new 中, 第多少个batch, 多少个head
 
     if USE_INITIAL_STATE:
-        h0 = h0 + i_nh * K*V
+        h0 = h0 + i_nh * K*V    # 第多少个nh 中, K,V的状态
     if STORE_FINAL_STATE:
         ht = ht + i_nh * K*V
 
     # load initial state
     if USE_INITIAL_STATE:
         # 返回 input tensor中，某个块的指针
-        # base: tensor, shape, strides, offsets, block_shape, order, _semantic=None
+        # base(tensor), shape, strides, offsets, block_shape, order, _semantic=None
         p_h0_1 = tl.make_block_ptr(h0, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0))
         b_h1 += tl.load(p_h0_1, boundary_check=(0, 1)).to(tl.float32)
         if K > 64:
@@ -123,7 +131,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             p_h0_4 = tl.make_block_ptr(h0, (K, V), (V, 1), (192, i_v * BV), (64, BV), (1, 0))
             b_h4 += tl.load(p_h0_4, boundary_check=(0, 1)).to(tl.float32)
 
-    # main recurrence
+    # main recurrence 从0 开始, 计算多少个chunk
     for i_t in range(NT):
         p_h1 = tl.make_block_ptr(h + i_t * H*K*V, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0))
         tl.store(p_h1, b_h1.to(p_h1.dtype.element_ty), boundary_check=(0, 1))
@@ -136,7 +144,8 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         if K > 192:
             p_h4 = tl.make_block_ptr(h + i_t * H*K*V, (K, V), (V, 1), (192, i_v * BV), (64, BV), (1, 0))
             tl.store(p_h4, b_h4.to(p_h4.dtype.element_ty), boundary_check=(0, 1))
-
+        
+        # 跳着读取 [T, K]
         p_w = tl.make_block_ptr(w, (T, K), (H*K, 1), (i_t * BT, 0), (BT, 64), (1, 0))
         b_w = tl.load(p_w, boundary_check=(0, 1))
         # Prediction: proj = w * h
