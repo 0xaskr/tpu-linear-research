@@ -30,3 +30,13 @@ gpu = [
 
 [tool.uv]
 find-links = ["https://storage.googleapis.com/jax-releases/libtpu_releases.html"]
+
+[tool.ruff]
+# 设置每行最大长度（可选）
+line-length = 88
+
+[tool.ruff.format]
+# 使用空格缩进
+indent-style = "space"
+# 设置缩进宽度为 2
+indent-width = 2

@@ -20,6 +20,8 @@ def chunk_gated_delta_rule_fwd_pallas_kernel(
     b_h = jnp.zeros((K, BV), dtype=jnp.float32)
 
     if USE_INITIAL_STATE:
+        # print(i_h)
+        # jax.debug.print("i_h = ", i_h)
         # h0_ptr: [B, H, K, V] -> [1, H, K, BV]
         b_h += h0_ptr[0, i_h, :, :].astype(jnp.float32)
 
@@ -29,22 +31,22 @@ def chunk_gated_delta_rule_fwd_pallas_kernel(
         h_ptr[0, i_h, i_t, :, :] = b_h.astype(h_ptr.dtype)
 
         start_t = i_t * BT
-        
+
         # Load w for current chunk: [BT, K]
         # w_ptr: [B, H, T, K] -> [1, H, BT, K]
-        b_w = w_ptr[0, i_h, start_t : start_t + BT, :] 
-        
+        b_w = w_ptr[0, i_h, start_t : start_t + BT, :]
+
         # Prediction: v_pred = w @ h
         # [BT, K] @ [K, BV] -> [BT, BV]
         b_v_pred = jnp.matmul(b_w.astype(jnp.float32), b_h)
-        
+
         # Load u (v_ptr) for current chunk: [BT, BV]
         # v_ptr: [B, H, T, V] -> [1, H, BT, BV]
         b_u = v_ptr[0, i_h, start_t : start_t + BT, :]
-        
+
         # Residual: v_new = u - b_v_pred
         b_v_new = b_u.astype(jnp.float32) - b_v_pred
-        
+
         if SAVE_NEW_VALUE:
             v_new_ptr[0, i_h, start_t : start_t + BT, :] = b_v_new.astype(v_new_ptr.dtype)
 
@@ -52,17 +54,17 @@ def chunk_gated_delta_rule_fwd_pallas_kernel(
             # g_ptr: [B, H, T] -> [1, H, BT]
             b_g_chunk = g_ptr[0, i_h, start_t : start_t + BT].astype(jnp.float32)
             b_g_last = b_g_chunk[BT - 1]
-            
+
             if USE_EXP2:
                 b_decay_v = jnp.exp2(b_g_last - b_g_chunk)
                 b_decay_h = jnp.exp2(b_g_last)
             else:
                 b_decay_v = jnp.exp(b_g_last - b_g_chunk)
                 b_decay_h = jnp.exp(b_g_last)
-            
+
             mask = (start_t + jnp.arange(BT)) < T
             b_decay_v = jnp.where(mask, b_decay_v, 0.0)
-            
+
             b_v_new = b_v_new * b_decay_v[:, None]
             b_h = b_h * b_decay_h
 
@@ -70,7 +72,7 @@ def chunk_gated_delta_rule_fwd_pallas_kernel(
             # gk_ptr: [B, H, T, K] -> [1, H, BT, K]
             b_gk_chunk = gk_ptr[0, i_h, start_t : start_t + BT, :].astype(jnp.float32)
             b_gk_last = b_gk_chunk[BT - 1]
-            
+
             if USE_EXP2:
                 b_h = b_h * jnp.exp2(b_gk_last)[:, None]
             else:
@@ -98,7 +100,7 @@ def chunk_gated_delta_rule_fwd_h_jax(
         g = jnp.transpose(g, (0, 2, 1))
     if gk is not None:
         gk = jnp.transpose(gk, (0, 2, 1, 3))
-    
+
     B, H, T, K = k.shape
     V = u.shape[-1]
     BT = chunk_size
@@ -117,7 +119,7 @@ def chunk_gated_delta_rule_fwd_h_jax(
     res_h = jnp.empty((B, H, NT, K, V), dtype=k.dtype)
     res_v_new = jnp.empty((B, H, T, V), dtype=u.dtype)
     res_ht = jnp.empty((B, H, K, V), dtype=jnp.float32)
-    
+
     def kernel_wrapper(k_p, v_p, w_p, g_p, gk_p, h0_p, h_p, v_new_p, ht_p):
         chunk_gated_delta_rule_fwd_pallas_kernel(
             k_p, v_p, w_p, g_p, gk_p, h0_p,
@@ -152,11 +154,11 @@ def chunk_gated_delta_rule_fwd_h_jax(
             pl.BlockSpec((1, H, T, BV), lambda i_v, i_nh: (i_nh // H, 0, 0, i_v)), # v_new
             pl.BlockSpec((1, H, K, BV), lambda i_v, i_nh: (i_nh // H, 0, 0, i_v)), # ht
         ],
-        interpret=True
+        interpret=False
     )(k, u, w, dummy_g, dummy_gk, dummy_h0)
 
     # Transpose back to original layout [B, T, H, ...]
     out_h = jnp.transpose(out_h, (0, 2, 1, 3, 4))
     out_v_new = jnp.transpose(out_v_new, (0, 2, 1, 3))
-    
+
     return out_h, (out_v_new if save_new_value else None), (out_ht if output_final_state else None)

@@ -50,7 +50,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     V: tl.constexpr,    # value size
     BT: tl.constexpr,   # chunk_size
     BV: tl.constexpr,   # block value size
-    USE_G: tl.constexpr,  
+    USE_G: tl.constexpr,
     USE_GK: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
     STORE_FINAL_STATE: tl.constexpr,
@@ -81,7 +81,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     # （BV, B * H）
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
-    
+
     # 多少个token 以后
     bos = i_n * T
     # NT = tl.cdiv(T, BT)
@@ -100,20 +100,26 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
 
     # calculate offset
     # Beginning of Sequence 不同的token, 起始
-    # Beginning of History  不同batc下的的histtory, 
-    (i_n * NT * H + i_h) * K * V
-    h = h[i_n,:,i_h:,:,:]
-    h += (boh * H + i_h).to(tl.int64) * K * V   # 在h中, 第多少个batch, 第多少个head
-    v += (bos * H + i_h).to(tl.int64) * V       # v中, 第多少个batch, 多少个head
-    k += (bos * H + i_h).to(tl.int64) * K       # k中, 第多少个batch, 多少个head
-    w += (bos * H + i_h).to(tl.int64) * K       # w中, 第多少个batch, 多少个head
+    # Beginning of History  不同batc下的的histtory,
+    # boh = (i_n * NT * H + i_h) * K * V
+    # bos = (i_n * T * H + i_h)
+    # h = h[i_n,:,i_h:,:,:]                     # 理论应该可以
+                                                # h/v 双重映射, k/w只切i_nh, g/gk 尝试不切, 因为他们有动态的参数, 可以在pad后尝试, h0/ht 双重映射
+    h += (boh * H + i_h).to(tl.int64) * K * V   # 在h中, 第多少个batch, 第多少个head, 后续循环中, [B, NT, H, K, V] -> [i_n: i_n + 1, t_i:t_i + 1, 1, 64, BV] * NT
+    v += (bos * H + i_h).to(tl.int64) * V       # v中, 第多少个batch, 多少个head, v : [B, T, H, V] -> [i_n: i_n + 1, t_i * BT: t_i* BT + BT, 1, BV] * NT
+    k += (bos * H + i_h).to(tl.int64) * K       # k中, 第多少个batch, 多少个head, k : [B, T, H, K] -> [i_n: i_n + 1, BT, i_h : i_h + 1, 64]
+    w += (bos * H + i_h).to(tl.int64) * K       # w中, 第多少个batch, 多少个head, w : [B, T, H, K] -> [T, K] * NT
+                                                # g中, 第多少个batch, 第多少个token, 第多少个head, 不切, [B, T, H]
+                                                # gk 第多少个batch, 第多少个token, 第多少个head, 第多少个k, 不切, [B, T, H, K]
+                                                # h0中，[B, H, K, V]
+                                                # ht, 第多少个nh中，[B, H, K, V] -> [1, 1, 64, BV]
     if SAVE_NEW_VALUE:
-        v_new += (bos * H + i_h).to(tl.int64) * V   # v_new 中, 第多少个batch, 多少个head
+        v_new += (bos * H + i_h).to(tl.int64) * V   # v_new 中, 第多少个batch, 多少个head, v_new [B, T, H, V] -> [i_n: i_n + 1, t_i * BT: t_i* BT + BT, 1, BV] * NT
 
     if USE_INITIAL_STATE:
         h0 = h0 + i_nh * K*V    # 第多少个nh 中, K,V的状态
     if STORE_FINAL_STATE:
-        ht = ht + i_nh * K*V
+        ht = ht + i_nh * K*V    # 第多少个nh中
 
     # load initial state
     if USE_INITIAL_STATE:
@@ -144,7 +150,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         if K > 192:
             p_h4 = tl.make_block_ptr(h + i_t * H*K*V, (K, V), (V, 1), (192, i_v * BV), (64, BV), (1, 0))
             tl.store(p_h4, b_h4.to(p_h4.dtype.element_ty), boundary_check=(0, 1))
-        
+
         # 跳着读取 [T, K]
         p_w = tl.make_block_ptr(w, (T, K), (H*K, 1), (i_t * BT, 0), (BT, 64), (1, 0))
         b_w = tl.load(p_w, boundary_check=(0, 1))
@@ -226,6 +232,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
 
         # Update: h += k^T * v_new
         # 更新: h += k^T * v_new
+        # 取 [T, K]^t * NT
         p_k = tl.make_block_ptr(k, (K, T), (1, H*K), (0, i_t * BT), (64, BT), (0, 1))
         b_k = tl.load(p_k, boundary_check=(0, 1))
         b_h1 += tl.dot(b_k, b_v)
@@ -552,7 +559,7 @@ def chunk_gated_delta_rule_fwd_h(
     NT = triton.cdiv(T, BT)
 
     assert K <= 256, "current kernel does not support head dimension larger than 256."
-    
+
     # h 代表了 chunk内 局部的状态
     h = k.new_empty(B, NT, H, K, V)
 
