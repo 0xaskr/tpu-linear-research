@@ -74,7 +74,7 @@ def chunk_gated_delta_rule_fwd(
     if (K > 128):
       b_w = w_ref[0, 0, i_t * BT: i_t * BT + BT, 128:192]
       b_v += jnp.dot(b_w.astype(jnp.float32), b_h3)
-    if (K > 128):
+    if (K > 192):
       b_w = w_ref[0, 0, i_t * BT: i_t * BT + BT, 192:256]
       b_v += jnp.dot(b_w.astype(jnp.float32), b_h4)
     b_v = b_v.astype(b_w.dtype)
@@ -192,7 +192,7 @@ def kernel_wrapper(
   final_state = jnp.zeros((B, H, K, V), dtype=jnp.float32) if output_final_state else None
 
   h_spec = jax.ShapeDtypeStruct(h.shape, h.dtype)
-  v_new_spec = jax.ShapeDtypeStruct(u.shape, u.dtype)
+  v_new_spec = jax.ShapeDtypeStruct([B, H, T, V], u.dtype)
   final_state_spec = jax.ShapeDtypeStruct([B, H, K, V], jnp.float32)
 
   k = jnp.transpose(k, [0, 2, 1, 3])    # [B, T, H, K] -> [B, H, T, K]
