@@ -1,5 +1,7 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
-
+import os
+os.environ["TRITON_CPU_BACKEND"] = "1"
+os.environ["TRITON_INTERPRET"] = "1"
 import torch
 import triton
 import triton.language as tl
@@ -156,7 +158,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         b_w = tl.load(p_w, boundary_check=(0, 1))
         # Prediction: proj = w * h
         # 预测: proj = w * h
-        b_v = tl.dot(b_w, b_h1.to(b_w.dtype))
+        b_v = tl.dot(b_w, b_h1.to(b_w.dtype))   # fp32 out
         if K > 64:
             p_w = tl.make_block_ptr(w, (T, K), (H*K, 1), (i_t * BT, 64), (BT, 64), (1, 0))
             b_w = tl.load(p_w, boundary_check=(0, 1))
@@ -190,8 +192,8 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                 b_v = b_v * tl.where(m_t, tl.math.exp2(b_g_last - b_g), 0)[:, None]
                 b_g_last = tl.math.exp2(b_g_last)
             else:
-                b_v = b_v * tl.where(m_t, exp(b_g_last - b_g), 0)[:, None]
-                b_g_last = exp(b_g_last)
+                b_v = b_v * tl.where(m_t, tl.math.exp(b_g_last - b_g), 0)[:, None]
+                b_g_last = tl.math.exp(b_g_last)
             b_h1 *= b_g_last
             if K > 64:
                 b_h2 *= b_g_last
@@ -207,28 +209,28 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             if USE_EXP2:
                 b_h1 *= tl.math.exp2(b_gk_last1)[:, None]
             else:
-                b_h1 *= exp(b_gk_last1)[:, None]
+                b_h1 *= tl.math.exp(b_gk_last1)[:, None]
             if K > 64:
                 o_k2 = 64 + o_k1
                 b_gk_last2 = tl.load(gk + (bos + last_idx) * H*K + i_h * K + o_k2, mask=(o_k2 < K), other=0.).to(tl.float32)
                 if USE_EXP2:
                     b_h2 *= tl.math.exp2(b_gk_last2)[:, None]
                 else:
-                    b_h2 *= exp(b_gk_last2)[:, None]
+                    b_h2 *= tl.math.exp(b_gk_last2)[:, None]
             if K > 128:
                 o_k3 = 128 + o_k1
                 b_gk_last3 = tl.load(gk + (bos + last_idx) * H*K + i_h * K + o_k3, mask=(o_k3 < K), other=0.).to(tl.float32)
                 if USE_EXP2:
                     b_h3 *= tl.math.exp2(b_gk_last3)[:, None]
                 else:
-                    b_h3 *= exp(b_gk_last3)[:, None]
+                    b_h3 *= tl.math.exp(b_gk_last3)[:, None]
             if K > 192:
                 o_k4 = 192 + o_k1
                 b_gk_last4 = tl.load(gk + (bos + last_idx) * H*K + i_h * K + o_k4, mask=(o_k4 < K), other=0.).to(tl.float32)
                 if USE_EXP2:
                     b_h4 *= tl.math.exp2(b_gk_last4)[:, None]
                 else:
-                    b_h4 *= exp(b_gk_last4)[:, None]
+                    b_h4 *= tl.math.exp(b_gk_last4)[:, None]
         b_v = b_v.to(k.dtype.element_ty)
 
         # Update: h += k^T * v_new

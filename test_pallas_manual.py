@@ -67,21 +67,22 @@ def chunk_gated_delta_rule_fwd(
       h_ref[0, i_t, 0, 192:256, 0:BV] = b_h4.astype(h_ref.dtype)  # type: ignore
 
     b_w = w_ref[0, 0, i_t * BT: i_t * BT + BT, 0:64]
-    b_v = jnp.dot(b_w.astype(jnp.float32), b_h1)
+    b_v = jnp.dot(b_w, b_h1.astype(b_w.dtype), preferred_element_type=jnp.float32)
+    # b_v = jnp.dot(b_w.astype(jnp.float32), b_h1, precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
+
     if (K > 64):
       b_w = w_ref[0, 0, i_t * BT: i_t * BT + BT, 64:128]
-      b_v += jnp.dot(b_w.astype(jnp.float32), b_h2)
+      b_v += jnp.dot(b_w, b_h2.astype(b_w.dtype), preferred_element_type=jnp.float32)
     if (K > 128):
       b_w = w_ref[0, 0, i_t * BT: i_t * BT + BT, 128:192]
-      b_v += jnp.dot(b_w.astype(jnp.float32), b_h3)
+      b_v += jnp.dot(b_w, b_h3.astype(b_w.dtype), preferred_element_type=jnp.float32)
     if (K > 192):
       b_w = w_ref[0, 0, i_t * BT: i_t * BT + BT, 192:256]
-      b_v += jnp.dot(b_w.astype(jnp.float32), b_h4)
-    b_v = b_v.astype(b_w.dtype)
-
-    b_v = v_ref[0, 0, i_t * BT: i_t * BT + BT, 0:BV] - b_v
+      b_v += jnp.dot(b_w, b_h4.astype(b_w.dtype), preferred_element_type=jnp.float32)
+    b_v = v_ref[0, 0, i_t * BT: i_t * BT + BT, 0:BV].astype(b_v.dtype) - b_v
 
     if (SAVE_NEW_VALUE):
+      print("v_new_dtype = ", v_new_ref.dtype, b_v.dtype)
       v_new_ref[0, 0, i_t * BT: i_t * BT + BT, 0:BV] = b_v.astype(v_new_ref.dtype)
 
     # 如果证明, T被pad到BT的整数倍, 这里
@@ -90,8 +91,8 @@ def chunk_gated_delta_rule_fwd(
 
     if (USE_G):
       m_t = (i_t * BT + jnp.arange(0, BT)) < T
-      b_g_last = g_ref[0, idx_h, last_idx]
-      b_g = g_ref[0, idx_h, i_t * BT: i_t * BT + BT]
+      b_g_last = g_ref[0, idx_h, last_idx].astype(jnp.float32)
+      b_g = g_ref[0, idx_h, i_t * BT: i_t * BT + BT].astype(jnp.float32)
       if USE_EXP2:
         b_v = b_v * jnp.where(m_t, jnp.exp2(b_g_last - b_g), 0)[:,None]
         b_g_last = jnp.exp2(b_g_last)
@@ -109,46 +110,46 @@ def chunk_gated_delta_rule_fwd(
 
     if USE_GK:
       o_k1 = jnp.arange(0, 64)
-      b_gk_last1 = jnp.where(o_k1 < K, gk_ref[0, 0, last_idx, 0:64], 0)
+      b_gk_last1 = jnp.where(o_k1 < K, gk_ref[0, 0, last_idx, 0:64], 0).astype(jnp.float32)
       if USE_EXP2:
         b_h1 *= jnp.exp2(b_gk_last1)[:, None]
       else:
         b_h1 *= jnp.exp(b_gk_last1)[:, None]
       if K > 64:
         o_k2 = 64 + o_k1
-        b_gk_last2 = jnp.where(o_k2 < K, gk_ref[0, 0, last_idx, 64:128], 0)
+        b_gk_last2 = jnp.where(o_k2 < K, gk_ref[0, 0, last_idx, 64:128], 0).astype(jnp.float32)
         if USE_EXP2:
           b_h2 *= jnp.exp2(b_gk_last2)[:, None]
         else:
           b_h2 *= jnp.exp(b_gk_last2)[:, None]
       if K > 128:
         o_k3 = 128 + o_k1
-        b_gk_last3 = jnp.where(o_k3 < K, gk_ref[0, 0, last_idx, 128:192], 0)
+        b_gk_last3 = jnp.where(o_k3 < K, gk_ref[0, 0, last_idx, 128:192], 0).astype(jnp.float32)
         if USE_EXP2:
           b_h3 *= jnp.exp2(b_gk_last3)[:, None]
         else:
           b_h3 *= jnp.exp(b_gk_last3)[:, None]
       if K > 192:
         o_k4 = 192 + o_k1
-        b_gk_last4 = jnp.where(o_k4 < K, gk_ref[0, 0, last_idx, 192:256], 0)
+        b_gk_last4 = jnp.where(o_k4 < K, gk_ref[0, 0, last_idx, 192:256], 0).astype(jnp.float32)
         if USE_EXP2:
           b_h4 *= jnp.exp2(b_gk_last4)[:, None]
         else:
           b_h4 *= jnp.exp(b_gk_last4)[:, None]
 
-    b_v = b_v.astype(k_ref.dtype)
+    # b_v = b_v.astype(k_ref.dtype)
 
     b_k = k_ref[0, 0, i_t * BT:i_t * BT + BT, 0:64].reshape(BT, 64).transpose(1, 0)
-    b_h1 += jnp.dot(b_k, b_v, preferred_element_type=jnp.float32)
+    b_h1 += jnp.dot(b_k.astype(jnp.float32), b_v.astype(jnp.float32), precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
     if K > 64:
       b_k = k_ref[0, 0, i_t * BT:i_t * BT + BT, 64:128].reshape(BT, 64).transpose(1, 0)
-      b_h2 += jnp.dot(b_k, b_v)
+      b_h2 += jnp.dot(b_k.astype(jnp.float32), b_v.astype(jnp.float32), precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
     if K > 128:
       b_k = k_ref[0, 0, i_t * BT:i_t * BT + BT, 128:192].reshape(BT, 64).transpose(1, 0)
-      b_h3 += jnp.dot(b_k, b_v)
+      b_h3 += jnp.dot(b_k.astype(jnp.float32), b_v.astype(jnp.float32), precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
     if K > 192:
       b_k = k_ref[0, 0, i_t * BT:i_t * BT + BT, 192:256].reshape(BT, 64).transpose(1, 0)
-      b_h4 += jnp.dot(b_k, b_v)
+      b_h4 += jnp.dot(b_k.astype(jnp.float32), b_v.astype(jnp.float32), precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
 
   if STORE_FINAL_STATE:
     ht_ref[0, 0, 0:64, 0:BV] = b_h1.astype(ht_ref.dtype)
@@ -159,13 +160,12 @@ def chunk_gated_delta_rule_fwd(
     if K > 192:
       ht_ref[0, 0, 192:256, 0:BV] = b_h4.astype(ht_ref.dtype)
 
-def kernel_wrapper(
+def chunk_gated_delta_rule_fwd_h(
     k: jax.Array,
-
     w: jax.Array,
     u: jax.Array,
-    g: jax.Array,
-    gk: jax.Array,
+    g: jax.Array | None = None,
+    gk: jax.Array | None = None,
     initial_state: jax.Array | None = None,
     output_final_state: bool = False,
     chunk_size: int = 64,
@@ -182,8 +182,10 @@ def kernel_wrapper(
   assert k.shape == (B, T, H, K)
   assert w.shape == (B, T, H, K)
   assert u.shape == (B, T, H, V)
-  assert g.shape == (B, T, H)
-  assert gk.shape == (B, T, H, K)
+  if g is not None:
+    assert g.shape == (B, T, H)
+  if gk is not None:
+    assert gk.shape == (B, T, H, K)
   if (initial_state is not None):
      assert initial_state.shape == (B, H, K, V)
 
@@ -198,10 +200,18 @@ def kernel_wrapper(
   k = jnp.transpose(k, [0, 2, 1, 3])    # [B, T, H, K] -> [B, H, T, K]
   u = jnp.transpose(u, [0, 2, 1, 3])    # [B, T, H, V] -> [B, H, T, V]
   w = jnp.transpose(w, [0, 2, 1, 3])    # [B, T, H, K] -> [B, H, T, K]
-  g = jnp.transpose(g, [0, 2, 1])       # [B, T, H]    -> [B, H, T]
-  gk = jnp.transpose(gk, [0, 2 ,1 ,3])  # [B, T, H, K] -> [B, H, T, K]
-  g_fp32 = g.astype(jnp.float32)
-  gk_fp32 = gk.astype(jnp.float32)
+  if g is not None:
+    g = jnp.transpose(g, [0, 2, 1])       # [B, T, H]    -> [B, H, T]
+    g_fp32 = g.astype(jnp.float32)
+  else:
+    g_fp32 = None
+
+  if gk is not None:
+    gk = jnp.transpose(gk, [0, 2 ,1 ,3])  # [B, T, H, K] -> [B, H, T, K]
+    gk_fp32 = gk.astype(jnp.float32)
+  else:
+    gk_fp32 = None
+
   # v_new = jnp.transpose(v_new, [0, 2, 1, 3])  # [B, T, H, V] -> [B, H, T, V]
 
   k_blockspec = pl.BlockSpec([1, 1, T, K], index_map = lambda v, b, h: (b, h, 0, 0))        # need trans
@@ -237,8 +247,9 @@ def kernel_wrapper(
     ),
     grid=grid,
     out_shape=[h_spec, v_new_spec, final_state_spec],
-    in_specs=[k_blockspec, u_blockspec, w_blockspec, g_blockspec, gk_blockspec, init_blockspec],
+    in_specs=[k_blockspec, u_blockspec, w_blockspec, g_blockspec if (g is not None) else None, gk_blockspec if (gk is not None) else None, init_blockspec],
     out_specs=[h_blockspec, v_new_blockspec, final_out_blockspec],
+    # interpret=True
   )(k, u, w, g_fp32, gk_fp32, initial_state)
 
   v_out = jnp.transpose(v_out, [0, 2, 1, 3]) # [B, H, T, V] -> [B, T, H, V]
