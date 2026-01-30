@@ -1,4 +1,7 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
+import os
+os.environ["TRITON_CPU_BACKEND"] = "1"
+os.environ["TRITON_INTERPRET"] = "1"
 
 import torch
 import triton
@@ -293,28 +296,28 @@ def chunk_gla_fwd_A_kernel_intra_sub_intra_merge(
 @triton.heuristics({
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
-@triton.autotune(
-    configs=[
-        triton.Config({'BK': BK, 'BV': BV}, num_warps=num_warps, num_stages=num_stages)
-        for BK in [32, 64]
-        for BV in [64, 128]
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
-    key=['BT'],
-    **autotune_cache_kwargs,
-)
+# @triton.autotune(
+#     configs=[
+#         triton.Config({'BK': BK, 'BV': BV}, num_warps=num_warps, num_stages=num_stages)
+#         for BK in [32, 64]
+#         for BV in [64, 128]
+#         for num_warps in [2, 4, 8]
+#         for num_stages in [2, 3, 4]
+#     ],
+#     key=['BT'],
+#     **autotune_cache_kwargs,
+# )
 @triton.jit(do_not_specialize=['T'])
 def chunk_gla_fwd_kernel_o(
-    q,
-    v,
-    g,
-    h,
-    o,
-    A,
+    q,  # [B, T, H, K]
+    v,  # [B, T, H, V]
+    g,  # [B, T, H, K]
+    h,  # [B, NT, H, K, V]
+    o,  # [B, T, H, V]
+    A,  # [B, T, H, BT]
     cu_seqlens,
     chunk_indices,
-    scale,
+    scale,  # float
     T,
     H: tl.constexpr,
     K: tl.constexpr,
@@ -325,25 +328,55 @@ def chunk_gla_fwd_kernel_o(
     USE_EXP2: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
+    """
+    Triton kernel for computing the final output O.
+    计算最终输出 O 的 Triton 内核。
+
+    Parallelism:
+    并行性:
+    - Blocks (Program IDs) map to (Batch * Heads) and (Values / BV).
+      线程块映射到 (Batch * Heads) 和 (Values切片)。
+    - Within each block, we process one sequence (or head) serially over chunks (NT).
+      在每个块内，串行处理一个序列的所有 Chunk。
+
+    Key Logic:
+    核心逻辑:
+    1. Inter-Chunk (Recurrence):
+       块间 (循环):
+       - Load queries q and gating g for the current chunk.
+       - Load hidden state h from the previous chunk.
+       - Compute: o_inter = (q * exp(g)) * h
+    2. Intra-Chunk (Attention):
+       块内 (注意力):
+       - Load local attention scores A and values v.
+       - Compute: o_intra = A * v
+    3. Combination:
+       结合:
+       - o = o_inter * scale + o_intra
+    """
+    # grid = (bv, NT, B * H)
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
-    if IS_VARLEN:
+    if IS_VARLEN and False:
         i_tg = i_t
         i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
         T = eos - bos
-        NT = tl.cdiv(T, BT)
+        NT = (T + BT - 1) // BT
     else:
-        NT = tl.cdiv(T, BT)
+        NT = (T + BT - 1) // BT
         i_tg = i_b * NT + i_t
         bos, eos = i_b * T, i_b * T + T
 
     m_s = tl.arange(0, BT)[:, None] >= tl.arange(0, BT)[None, :]
 
     b_o = tl.zeros([BT, BV], dtype=tl.float32)
-    for i_k in range(tl.cdiv(K, BK)):
+    for i_k in range((K + BK - 1) // BK):
+        # [B, T, H, K] -> [T, K] 从 第多少个batch， 抵多少个head 取[BT, BK]
         p_q = tl.make_block_ptr(q + (bos * H + i_h) * K, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+        # [B, T, H, K] -> [T, K] 从 第多少个batch， 抵多少个head 取[BT, BK]
         p_g = tl.make_block_ptr(g + (bos * H + i_h) * K, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+        # [B, NT, H, K, V] -> 第多少个batch, 第多少个nt, 第多少个head, 取 [BK, BV]
         p_h = tl.make_block_ptr(h + (i_tg * H + i_h) * K*V, (K, V), (V, 1), (i_k * BK, i_v * BV), (BK, BV), (1, 0))
 
         # [BT, BK]
@@ -352,9 +385,9 @@ def chunk_gla_fwd_kernel_o(
         b_g = tl.load(p_g, boundary_check=(0, 1)).to(tl.float32)
         # [BT, BK]
         if USE_EXP2:
-            b_qg = (b_q * exp2(b_g)).to(b_q.dtype)
+            b_qg = (b_q * tl.math.exp2(b_g)).to(b_q.dtype)
         else:
-            b_qg = (b_q * exp(b_g)).to(b_q.dtype)
+            b_qg = (b_q * tl.exp(b_g)).to(b_q.dtype)
         # [BK, BV]
         b_h = tl.load(p_h, boundary_check=(0, 1))
         # works but dkw, owing to divine benevolence
@@ -362,8 +395,11 @@ def chunk_gla_fwd_kernel_o(
         if i_k >= 0:
             b_o += tl.dot(b_qg, b_h.to(b_qg.dtype))
     b_o *= scale
+    # [B, T, H, V] -> [T, V] 从 第多少个batch， 抵多少个head 取[BT, BV]
     p_v = tl.make_block_ptr(v + (bos * H + i_h) * V, (T, V), (H*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
+    # [B, T, H, V] -> [T, V] 从 第多少个batch， 抵多少个head 取[BT, BV]
     p_o = tl.make_block_ptr(o + (bos * H + i_h) * V, (T, V), (H*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
+    # [B, T， H， BT] -> [T, BT] 从 第多少个batch， 抵多少个head 取[BT, BT]
     p_A = tl.make_block_ptr(A + (bos * H + i_h) * BT, (T, BT), (H*BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
     # [BT, BV]
     b_v = tl.load(p_v, boundary_check=(0, 1))
@@ -866,6 +902,41 @@ def chunk_gla_fwd_o_gk(
     chunk_indices: torch.LongTensor | None = None,
     use_exp2: bool = False,
 ):
+    """
+    Final Output Computation (Forward Pass).
+    最终输出计算 (前向传播)。
+
+    This function computes the final output for Gated Linear Attention (GLA) by combining
+    the intra-chunk attention scores and the inter-chunk recurrent states.
+    此函数通过结合块内注意力分数和块间循环状态，计算门控线性注意力 (GLA) 的最终输出。
+
+    Mechanism:
+    机制:
+    1. Inter-chunk: The hidden state `h` (memory from previous chunks) is combined with queries `q` and gating `g`.
+       块间: 隐藏状态 `h` (来自前一个块的记忆) 与查询 `q` 和门控 `g` 结合。
+       o_inter = (q * exp(g)) * h
+    2. Intra-chunk: The local attention scores `A` are applied to values `v`.
+       块内: 局部注意力分数 `A` 应用于值 `v`。
+       o_intra = A * v
+    3. Combine: The two components are scaled and summed to produce the final output.
+       结合: 将这两个部分缩放并求和，生成最终输出。
+       o = scale * o_inter + o_intra
+
+    Args:
+        q (torch.Tensor): [B, T, H, K] - Queries.
+        v (torch.Tensor): [B, T, H, V] - Values (or corrected values).
+        g (torch.Tensor): [B, T, H, K] - Cumulative log-decay gates.
+        A (torch.Tensor): [B, T, H, BT] - Intra-chunk attention scores.
+        h (torch.Tensor): [B, NT, H, K, V] - Hidden states at chunk boundaries.
+        scale (float): Scaling factor for the attention scores.
+        cu_seqlens (torch.LongTensor): [N+1] - Cumulative sequence lengths.
+        chunk_size (int): Size of each chunk.
+        chunk_indices (torch.LongTensor): [NT, 2] - Chunk indices.
+        use_exp2 (bool): Whether to use exp2 for gating.
+
+    Returns:
+        o (torch.Tensor): [B, T, H, V] - Final output.
+    """
     B, T, H, K, V = *q.shape, v.shape[-1]
     BT = chunk_size
 
@@ -874,7 +945,8 @@ def chunk_gla_fwd_o_gk(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
     o = torch.empty_like(v)
-    def grid(meta): return (triton.cdiv(V, meta['BV']), NT, B * H)
+    BK, BV = 32, 64
+    grid = (triton.cdiv(V, BV), NT, B * H)
     chunk_gla_fwd_kernel_o[grid](
         q=q,
         v=v,
@@ -890,7 +962,10 @@ def chunk_gla_fwd_o_gk(
         K=K,
         V=V,
         BT=BT,
+        BK=BK,
+        BV=BV,
         USE_EXP2=use_exp2,
+        IS_VARLEN=cu_seqlens is not None
     )
     return o
 

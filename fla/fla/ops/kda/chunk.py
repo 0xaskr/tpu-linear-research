@@ -55,7 +55,7 @@ def chunk_kda_fwd(
     # 使用 Delta Rule 跨 chunk 更新循环状态 (RNN state)。
     # h: history state after each chunk / 每个 chunk 之后的历史状态
     # v_new: updated values after applying the delta rule / 应用 delta rule 更新后的 value (v - correction)
-    
+
     print("kg_shape = ", kg.shape)  # [2, 128, 4, 64]
     print("k.shape = ", k.shape)    # [2, 128, 4, 64]
     print("w.shape = ", w.shape)    # [2, 128, 4, 64]
@@ -84,6 +84,7 @@ def chunk_kda_fwd(
     # 3. Output Computation / 输出计算
     # Compute the final output by combining local attention and historical state.
     # 结合局部注意力和历史状态计算最终输出。
+    # o: final output / 最终输出
     o = chunk_gla_fwd_o_gk(
         q=q,
         v=v_new, # Use the updated values
@@ -152,7 +153,7 @@ def chunk_kda_bwd(
         )
     else:
         w, u, qg, kg, v_new, h = kwargs["w"], kwargs["u"], kwargs["qg"], kwargs["kg"], kwargs["v_new"], kwargs["h"]
-    
+
     # 1. Gradient of Attention Scores / 注意力分数的梯度
     # dAqk = do @ v.T
     # dv = A @ do
@@ -183,7 +184,7 @@ def chunk_kda_bwd(
         chunk_indices=chunk_indices,
         use_exp2=True,
     )
-    
+
     # 3. Gradient of Inputs (Fused) / 输入及参数的梯度 (融合计算)
     dq, dk, dv, db, dg, dAkk = chunk_kda_bwd_wy_dqkg_fused(
         q=q,
@@ -254,7 +255,7 @@ class ChunkKDAFunction(torch.autograd.Function):
         chunk_indices = prepare_chunk_indices(
             cu_seqlens, chunk_size, cu_seqlens_cpu=cu_seqlens_cpu) if cu_seqlens is not None else None
         # 每个batch 切分成chunk_size 大小的多个chunk块，向上对齐
-        
+
         # 1. Gate Preprocessing / 门控预处理
         # If use_gate_in_kernel is True, compute the cumulative sum of gates (log-space decay).
         # 如果启用 use_gate_in_kernel，计算门控的累积和 (对数空间的衰减)。
@@ -298,7 +299,7 @@ class ChunkKDAFunction(torch.autograd.Function):
                 cu_seqlens=cu_seqlens,
                 chunk_indices=chunk_indices
             )
-        
+
         # 2. Q/K Normalization / Q/K 归一化
         # Optional L2 normalization for stability. / 可选的 L2 归一化以提高稳定性。
         # 公式 (L2 Norm):
@@ -368,7 +369,7 @@ class ChunkKDAFunction(torch.autograd.Function):
                 chunk_indices=chunk_indices,
                 lower_bound=ctx.lower_bound
             )
-        
+
         # 1. Main Backward Pass / 核心反向传播
         dq, dk, dv, db, dg, dh0 = chunk_kda_bwd(
             q=q,
@@ -389,7 +390,7 @@ class ChunkKDAFunction(torch.autograd.Function):
             disable_recompute=ctx.disable_recompute,
             w=w, u=u, qg=qg, kg=kg, v_new=v_new, h=h
         )
-        
+
         # 2. Gradient for L2 Norm (if used) / L2 归一化的梯度 (若使用)
         if ctx.use_qk_l2norm_in_kernel:
             dq = l2norm_bwd(q, q_rstd, dq)
