@@ -271,10 +271,11 @@ def chunk_gla_fwd_o_gk_kernel(q_ref, v_ref, g_ref, h_ref, a_ref,
     q = q_ref[...].reshape(BT, K)[:, idx_k * BK: (idx_k + 1) * BK]
     g = g_ref[...].reshape(BT, K)[:, idx_k * BK: (idx_k + 1) * BK]
     h = h_ref[...].reshape(K, BV)[idx_k * BK: (idx_k + 1) * BK, :]
+    # 这里是决定精度的重点
     if USE_EXP2:
-      qg = (q * jnp.exp2(g)).astype(q.dtype)
+      qg = (q.astype(jnp.float32) * jnp.exp2(g.astype(jnp.float32))).astype(q.dtype)
     else:
-      qg = (q * jnp.exp(g)).astype(q.dtype)
+      qg = (q.astype(jnp.float32) * jnp.exp(g.astype(jnp.float32))).astype(q.dtype)
 
     if idx_k >= 0:
       b_o += jnp.dot(qg, h.astype(qg.dtype), precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)

@@ -98,6 +98,10 @@ def run_comparison_o_gk():
         print("Skipping o_gk comparison: Triton function not found.")
         return
 
+    rng_dtype = torch.bfloat16
+    tirton_dtype = torch.float32
+    pallas_dtype = jnp.bfloat16
+
     B, T, H, K, V = 2, 64, 4, 64, 64
     chunk_size = 64
     use_exp2 = False
@@ -106,19 +110,24 @@ def run_comparison_o_gk():
     print(f"\nConfiguration o_gk: B={B}, T={T}, H={H}, K={K}, V={V}, chunk_size={chunk_size}")
 
     torch.manual_seed(42)
-    q = torch.randn((B, T, H, K), dtype=torch.float32)
-    v = torch.randn((B, T, H, V), dtype=torch.float32)
-    g = torch.randn((B, T, H, K), dtype=torch.float32)
-    A = torch.randn((B, T, H, chunk_size), dtype=torch.float32)
+    q = torch.randn((B, T, H, K), dtype=rng_dtype)
+    v = torch.randn((B, T, H, V), dtype=rng_dtype)
+    g = torch.randn((B, T, H, K), dtype=rng_dtype)
+    A = torch.randn((B, T, H, chunk_size), dtype=rng_dtype)
     # h shape: [B, NT, H, K, V]
     NT = (T + chunk_size - 1) // chunk_size
-    h = torch.randn((B, NT, H, K, V), dtype=torch.float32)
+    h = torch.randn((B, NT, H, K, V), dtype=rng_dtype)
 
     # Triton Run
+    q_pt = torch.tensor(q, device="cpu", dtype=tirton_dtype)
+    v_pt = torch.tensor(v, device="cpu", dtype=tirton_dtype)
+    g_pt = torch.tensor(g, device="cpu", dtype=tirton_dtype)
+    A_pt = torch.tensor(A, device="cpu", dtype=tirton_dtype)
+    h_pt = torch.tensor(h, device="cpu", dtype=tirton_dtype)
     print("Running Triton o_gk...")
     # q, v, g, A, h, scale, cu_seqlens, chunk_size, chunk_indices, use_exp2
     o_ref = triton_o_gk(
-        q, v, g, A, h,
+        q_pt, v_pt, g_pt, A_pt, h_pt,
         scale=scale,
         chunk_size=chunk_size,
         use_exp2=use_exp2
@@ -126,11 +135,11 @@ def run_comparison_o_gk():
 
     # Pallas Run
     print("Running Pallas o_gk...")
-    q_jax = jnp.array(q.numpy(), dtype=jnp.float32)
-    v_jax = jnp.array(v.numpy(), dtype=jnp.float32)
-    g_jax = jnp.array(g.numpy(), dtype=jnp.float32)
-    A_jax = jnp.array(A.numpy(), dtype=jnp.float32)
-    h_jax = jnp.array(h.numpy(), dtype=jnp.float32)
+    q_jax = jnp.array(q.to(torch.float32), dtype=pallas_dtype)
+    v_jax = jnp.array(v.to(torch.float32), dtype=pallas_dtype)
+    g_jax = jnp.array(g.to(torch.float32), dtype=pallas_dtype)
+    A_jax = jnp.array(A.to(torch.float32), dtype=pallas_dtype)
+    h_jax = jnp.array(h.to(torch.float32), dtype=pallas_dtype)
 
     o_jax = pallas_o_gk(
         q_jax, v_jax, g_jax, A_jax, h_jax,
