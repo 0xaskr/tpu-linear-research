@@ -264,27 +264,27 @@ def chunk_gla_fwd_o_gk_kernel(q_ref, v_ref, g_ref, h_ref, a_ref,
   NT = cdiv(T, BT)
   idx_tg = idx_b * NT + idx_t
 
-  m_s = jnp.arange(0, NT)[:, None] >= jnp.arange(0, BT)[None, :]
+  m_s = jnp.arange(0, BT)[:, None] >= jnp.arange(0, BT)[None, :]
   b_o = jnp.zeros([BT, BV], dtype=jnp.float32)
 
   for idx_k in range(cdiv(K, BK)):
     q = q_ref[...].reshape(BT, K)[:, idx_k * BK: (idx_k + 1) * BK]
     g = g_ref[...].reshape(BT, K)[:, idx_k * BK: (idx_k + 1) * BK]
-    h = h_ref[...].reshape(K, BV)[idx_k * BK: (idx_k + 1) * BK, BV]
+    h = h_ref[...].reshape(K, BV)[idx_k * BK: (idx_k + 1) * BK, :]
     if USE_EXP2:
-      qg = (q * jnp.exp2(g)).to(q.dtype)
+      qg = (q * jnp.exp2(g)).astype(q.dtype)
     else:
-      qg = (q * jnp.exp(g)).to(q.dtype)
+      qg = (q * jnp.exp(g)).astype(q.dtype)
 
     if idx_k >= 0:
-      b_o += jnp.dot(qg, h.to(qg.dtype))
+      b_o += jnp.dot(qg, h.astype(qg.dtype), precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
 
   b_o *= scale
   v = v_ref[...].reshape(BT, BV)
   a = a_ref[...].reshape(BT, BT)
   a = jnp.where(m_s, a, 0).astype(v.dtype)
-  b_o += jnp.dot(a, v)
-  o_ref[0, 0, 0, 0] = b_o.reshape(1, BT, 1, BV).astype(o_ref.dtype)
+  b_o += jnp.dot(a, v, precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
+  o_ref[...] = b_o.reshape(1, BT, 1, BV).astype(o_ref.dtype)
 
 
 def chunk_gla_fwd_o_gk(q : jax.Array,
@@ -325,12 +325,13 @@ def chunk_gla_fwd_o_gk(q : jax.Array,
   a_block_spec = pl.BlockSpec([1, BT, 1, BT], index_map = lambda v, bt, b, h: (b, bt * BT, h, 0))
 
   # TODO(baihua): use bh
-  o_spec = jax.ShapeDtypeStruct([B, H, T, V], v.dtype)
-  o_block_spec = pl.BlockSpec([1, BT, 1, BV], index_map = lambda v, bt, b, h: (b, bt * BT, h, 0))
+  o_spec = jax.ShapeDtypeStruct([B, T, H, V], v.dtype)
+  o_block_spec = pl.BlockSpec([1, BT, 1, BV], index_map = lambda v, bt, b, h: (b, bt * BT, h, v * BV))
   grid = (cdiv(V, BV), NT, B, H)
   o = pl.pallas_call(
     functools.partial(
         chunk_gla_fwd_o_gk_kernel,
+        scale=scale,
         T=T,
         H=H,
         K=K,

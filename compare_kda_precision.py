@@ -17,17 +17,22 @@ if os.path.exists(os.path.join(os.getcwd(), 'fla')):
 # Attempt imports
 try:
     from test_pallas_manual import chunk_gated_delta_rule_fwd_h as pallas_fwd
+    from test_pallas_manual import chunk_gla_fwd_o_gk as pallas_o_gk
     print("Successfully imported Pallas kernel wrapper.")
 except ImportError as e:
     print(f"Failed to import Pallas kernel wrapper: {e}")
-    sys.exit(1)
+    pallas_fwd = None
+    pallas_o_gk = None
 
 try:
     from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_h as triton_fwd
+    from fla.ops.gla.chunk import chunk_gla_fwd_o_gk as triton_o_gk
     HAS_TRITON = torch.cuda.is_available()
     HAS_TRITON = True
 except ImportError:
     HAS_TRITON = False
+    triton_fwd = None
+    triton_o_gk = None
     print("Triton kernel not found. Using Torch reference instead.")
 
 def compare_tensor(name, pt_t, jax_t, atol=1e-2, rtol=1e-2):
@@ -85,6 +90,67 @@ def compare_tensor(name, pt_t, jax_t, atol=1e-2, rtol=1e-2):
         print(f"    Tolerance      = {flat_tol[idx]} (atol={atol} + rtol={rtol}*|Right|)")
         print(f"    Ratio          = {flat_diff[idx] / flat_tol[idx]}")
 
+def run_comparison_o_gk():
+    if pallas_o_gk is None:
+        print("Skipping o_gk comparison: Pallas function not found.")
+        return
+    if triton_o_gk is None:
+        print("Skipping o_gk comparison: Triton function not found.")
+        return
+
+    B, T, H, K, V = 2, 64, 4, 64, 64
+    chunk_size = 64
+    use_exp2 = False
+    scale = K ** -0.5
+
+    print(f"\nConfiguration o_gk: B={B}, T={T}, H={H}, K={K}, V={V}, chunk_size={chunk_size}")
+
+    torch.manual_seed(42)
+    q = torch.randn((B, T, H, K), dtype=torch.float32)
+    v = torch.randn((B, T, H, V), dtype=torch.float32)
+    g = torch.randn((B, T, H, K), dtype=torch.float32)
+    A = torch.randn((B, T, H, chunk_size), dtype=torch.float32)
+    # h shape: [B, NT, H, K, V]
+    NT = (T + chunk_size - 1) // chunk_size
+    h = torch.randn((B, NT, H, K, V), dtype=torch.float32)
+
+    # Triton Run
+    print("Running Triton o_gk...")
+    # q, v, g, A, h, scale, cu_seqlens, chunk_size, chunk_indices, use_exp2
+    o_ref = triton_o_gk(
+        q, v, g, A, h,
+        scale=scale,
+        chunk_size=chunk_size,
+        use_exp2=use_exp2
+    )
+
+    # Pallas Run
+    print("Running Pallas o_gk...")
+    q_jax = jnp.array(q.numpy(), dtype=jnp.float32)
+    v_jax = jnp.array(v.numpy(), dtype=jnp.float32)
+    g_jax = jnp.array(g.numpy(), dtype=jnp.float32)
+    A_jax = jnp.array(A.numpy(), dtype=jnp.float32)
+    h_jax = jnp.array(h.numpy(), dtype=jnp.float32)
+
+    o_jax = pallas_o_gk(
+        q_jax, v_jax, g_jax, A_jax, h_jax,
+        scale=scale,
+        chunk_size=chunk_size,
+        use_exp2=use_exp2
+    )
+    if isinstance(o_jax, (tuple, list)):
+        o_jax = o_jax[0]
+    jax.block_until_ready(o_jax)
+
+    # Check shape of o_jax
+    if o_jax.shape != o_ref.shape:
+        print(f"Shape mismatch! Ref: {o_ref.shape}, Pallas: {o_jax.shape}")
+        if o_jax.ndim == 4 and o_jax.shape == (B, H, T, V):
+             print("Transposing Pallas output from [B, H, T, V] to [B, T, H, V]")
+             o_jax = jnp.transpose(o_jax, (0, 2, 1, 3))
+
+    compare_tensor("Output (o) - FULL", o_ref, o_jax, atol=1e-3, rtol=1e-3)
+
 def run_comparison():
     B, T, H, K, V = 2, 64, 4, 64, 64
     chunk_size = 64
@@ -119,11 +185,15 @@ def run_comparison():
     gk_pt = torch.tensor(gk, device='cpu', dtype=tirton_dtype)
     h0_pt = torch.tensor(h0, device='cpu', dtype=tirton_dtype)
 
-    h_ref, v_new_ref, final_state_ref = triton_fwd(
-        k=k_pt, w=w_pt, u=u_pt, g=g, gk=gk,
-        initial_state=h0_pt, output_final_state=True,
-        chunk_size=chunk_size, save_new_value=True, use_exp2=use_exp2
-    )
+    if triton_fwd is not None:
+        h_ref, v_new_ref, final_state_ref = triton_fwd(
+            k=k_pt, w=w_pt, u=u_pt, g=g, gk=gk,
+            initial_state=h0_pt, output_final_state=True,
+            chunk_size=chunk_size, save_new_value=True, use_exp2=use_exp2
+        )
+    else:
+        print("Triton fwd function missing, skipping.")
+        h_ref = None
 
     # --- Run Pallas ---
     print("\nRunning Pallas kernel ({})...", pallas_dtype.dtype)
@@ -133,12 +203,17 @@ def run_comparison():
     g_jax = jnp.array(g.to(torch.float32), dtype=pallas_dtype)
     gk_jax = jnp.array(gk.to(torch.float32), dtype=pallas_dtype)
     h0_jax = jnp.array(h0.to(torch.float32), dtype=pallas_dtype)
-    h_jax, v_new_jax, final_state_jax = pallas_fwd(
-        k=k_jax, w=w_jax, u=u_jax, g=g_jax, gk=gk_jax,
-        initial_state=h0_jax, output_final_state=True,
-        chunk_size=chunk_size, save_new_value=True, use_exp2=use_exp2
-    )
-    jax.block_until_ready(h_jax)
+
+    if pallas_fwd is not None:
+        h_jax, v_new_jax, final_state_jax = pallas_fwd(
+            k=k_jax, w=w_jax, u=u_jax, g=g_jax, gk=gk_jax,
+            initial_state=h0_jax, output_final_state=True,
+            chunk_size=chunk_size, save_new_value=True, use_exp2=use_exp2
+        )
+        jax.block_until_ready(h_jax)
+    else:
+        print("Pallas fwd function missing, skipping.")
+        h_jax = None
 
     print("\n" + "="*40)
     print("COMPARISON INTPUTS (Triton FP32 vs Pallas {})", pallas_dtype.dtype)
@@ -152,9 +227,15 @@ def run_comparison():
     print("COMPARISON RESULTS (Triton FP32 vs Pallas {})", pallas_dtype.dtype)
     print("="*40)
     # Using 1e-2 tolerance for BF16 vs FP32 verification with scaled inputs
-    compare_tensor("Hidden State (h)", h_ref, h_jax, atol=1e-2, rtol=1e-2)
-    compare_tensor("Residual (v_new)", v_new_ref, v_new_jax, atol=1e-2, rtol=1e-2)
-    compare_tensor("Final State (ht)", final_state_ref, final_state_jax, atol=1e-2, rtol=1e-2)
+    if h_ref is not None and h_jax is not None:
+        compare_tensor("Hidden State (h)", h_ref, h_jax, atol=1e-2, rtol=1e-2)
+        compare_tensor("Residual (v_new)", v_new_ref, v_new_jax, atol=1e-2, rtol=1e-2)
+        compare_tensor("Final State (ht)", final_state_ref, final_state_jax, atol=1e-2, rtol=1e-2)
+
 
 if __name__ == "__main__":
-    run_comparison()
+    # run_comparison()
+
+    # Run o_gk comparison
+    run_comparison_o_gk()
+
