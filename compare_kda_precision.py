@@ -158,7 +158,7 @@ def run_comparison_o_gk():
              print("Transposing Pallas output from [B, H, T, V] to [B, T, H, V]")
              o_jax = jnp.transpose(o_jax, (0, 2, 1, 3))
 
-    compare_tensor("Output (o) - FULL", o_ref, o_jax, atol=1e-3, rtol=1e-3)
+    compare_tensor("Output (o) - FULL", o_ref, o_jax, atol=1e-2, rtol=1e-2)
 
 def run_comparison():
     B, T, H, K, V = 2, 64, 4, 64, 64

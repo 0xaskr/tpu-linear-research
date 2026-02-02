@@ -278,14 +278,16 @@ def chunk_gla_fwd_o_gk_kernel(q_ref, v_ref, g_ref, h_ref, a_ref,
       qg = (q.astype(jnp.float32) * jnp.exp(g.astype(jnp.float32))).astype(q.dtype)
 
     if idx_k >= 0:
-      b_o += jnp.dot(qg, h.astype(qg.dtype), precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
+      b_o += jnp.dot(qg, h.astype(qg.dtype), preferred_element_type=jnp.float32)
+      # b_o += jnp.dot(qg.astype(jnp.float32), h.astype(jnp.float32), precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
 
   b_o *= scale
   v = v_ref[...].reshape(BT, BV)
   a = a_ref[...].reshape(BT, BT)
   a = jnp.where(m_s, a, 0).astype(v.dtype)
-  b_o += jnp.dot(a, v, precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
-  o_ref[...] = b_o.reshape(1, BT, 1, BV).astype(o_ref.dtype)
+  b_o += jnp.dot(a, v, preferred_element_type=jnp.float32)
+  # b_o += jnp.dot(a.astype(jnp.float32), v.astype(jnp.float32), precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
+  o_ref[...] = b_o.reshape(1, 1, BT, BV).astype(o_ref.dtype)
 
 
 def chunk_gla_fwd_o_gk(q : jax.Array,
@@ -319,15 +321,25 @@ def chunk_gla_fwd_o_gk(q : jax.Array,
   if chunk_indices is not None:
     pass
 
-  q_blockspec = pl.BlockSpec([1, BT, 1, K], index_map = lambda v, bt, b, h: (b, bt * BT, h, 0))
-  v_blockspec = pl.BlockSpec([1, BT, 1, BV], index_map = lambda v, bt, b, h: (b, bt * BT, h, v * BV))
-  g_blockspec = pl.BlockSpec([1, BT, 1, K], index_map = lambda v, bt, b, h: (b, bt * BT, h, 0))
+  # Transpose inputs to satisfy Pallas TPU alignment (dim -2 % 8 == 0)
+  # (B, T, H, K) -> (B, H, T, K)
+  q = jnp.transpose(q, (0, 2, 1, 3))
+  v = jnp.transpose(v, (0, 2, 1, 3))
+  g = jnp.transpose(g, (0, 2, 1, 3))
+  a = jnp.transpose(a, (0, 2, 1, 3))
+
+  # New BlockSpecs for (B, H, T, ...) layout
+  q_blockspec = pl.BlockSpec([1, 1, BT, K], index_map = lambda v, bt, b, h: (b, h, bt * BT, 0))
+  v_blockspec = pl.BlockSpec([1, 1, BT, BV], index_map = lambda v, bt, b, h: (b, h, bt * BT, v * BV))
+  g_blockspec = pl.BlockSpec([1, 1, BT, K], index_map = lambda v, bt, b, h: (b, h, bt * BT, 0))
+  # h stays (B, NT, H, K, V)
   h_blockspec = pl.BlockSpec([1, 1, 1, K, BV], index_map = lambda v, bt, b, h: (b, bt, h, 0, v * BV))
-  a_block_spec = pl.BlockSpec([1, BT, 1, BT], index_map = lambda v, bt, b, h: (b, bt * BT, h, 0))
+  a_block_spec = pl.BlockSpec([1, 1, BT, BT], index_map = lambda v, bt, b, h: (b, h, bt * BT, 0))
 
   # TODO(baihua): use bh
-  o_spec = jax.ShapeDtypeStruct([B, T, H, V], v.dtype)
-  o_block_spec = pl.BlockSpec([1, BT, 1, BV], index_map = lambda v, bt, b, h: (b, bt * BT, h, v * BV))
+  # Output (B, H, T, V)
+  o_spec = jax.ShapeDtypeStruct([B, H, T, V], v.dtype)
+  o_block_spec = pl.BlockSpec([1, 1, BT, BV], index_map = lambda v, bt, b, h: (b, h, bt * BT, v * BV))
   grid = (cdiv(V, BV), NT, B, H)
   o = pl.pallas_call(
     functools.partial(
@@ -346,9 +358,12 @@ def chunk_gla_fwd_o_gk(q : jax.Array,
     out_shape=[o_spec],
     in_specs=[q_blockspec, v_blockspec, g_blockspec, h_blockspec, a_block_spec],
     out_specs=[o_block_spec],
-    interpret=True
+    # interpret=True
   )(q, v, g, h, a)
 
+  if isinstance(o, (tuple, list)):
+    o = o[0]
+  o = jnp.transpose(o, (0, 2, 1, 3))
   return o
 
 
