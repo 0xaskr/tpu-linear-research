@@ -1,7 +1,4 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
-import os
-os.environ["TRITON_CPU_BACKEND"] = "1"
-os.environ["TRITON_INTERPRET"] = "1"
 
 import torch
 import triton
@@ -357,21 +354,21 @@ def chunk_gla_fwd_kernel_o(
     # grid = (bv, NT, B * H)
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
-    if IS_VARLEN and False:
+    if IS_VARLEN:
         i_tg = i_t
         i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
         T = eos - bos
-        NT = (T + BT - 1) // BT
+        NT = tl.cdiv(T, BT)
     else:
-        NT = (T + BT - 1) // BT
+        NT = tl.cdiv(T, BT)
         i_tg = i_b * NT + i_t
         bos, eos = i_b * T, i_b * T + T
 
     m_s = tl.arange(0, BT)[:, None] >= tl.arange(0, BT)[None, :]
 
     b_o = tl.zeros([BT, BV], dtype=tl.float32)
-    for i_k in range((K + BK - 1) // BK):
+    for i_k in range(tl.cdiv(K, BK)):
         # [B, T, H, K] -> [T, K] 从 第多少个batch， 抵多少个head 取[BT, BK]
         p_q = tl.make_block_ptr(q + (bos * H + i_h) * K, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
         # [B, T, H, K] -> [T, K] 从 第多少个batch， 抵多少个head 取[BT, BK]
@@ -944,8 +941,10 @@ def chunk_gla_fwd_o_gk(
         chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
-    o = torch.empty_like(v)
+    # Please ensure zeros, since vllm will use padding v
+    o = torch.zeros_like(v)
     BK, BV = 32, 64
+    # def grid(meta): return (triton.cdiv(V, meta['BV']), NT, B * H)
     grid = (triton.cdiv(V, BV), NT, B * H)
     chunk_gla_fwd_kernel_o[grid](
         q=q,

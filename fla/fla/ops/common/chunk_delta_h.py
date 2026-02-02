@@ -32,6 +32,7 @@ NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8, 16]
 #     use_cuda_graph=USE_CUDA_GRAPH,
 #     **autotune_cache_kwargs,
 # )
+# @triton.jit(do_not_specialize=['T'])
 @triton.jit
 def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     k,  # ptr [B, T, H, K]
@@ -83,13 +84,15 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     # （BV, B * H）
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
-
-    # 多少个token 以后
-    bos = i_n * T
-    # NT = tl.cdiv(T, BT)
-    # NT = int((T + BT - 1) // BT)
-    boh = i_n * NT
-    # 多少个chunk token以后
+    if IS_VARLEN:
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        T = eos - bos
+        NT = tl.cdiv(T, BT)
+        boh = tl.load(chunk_offsets + i_n).to(tl.int32)
+    else:
+        bos, eos = i_n * T, i_n * T + T
+        NT = tl.cdiv(T, BT)
+        boh = i_n * NT
 
     # [BK, BV]
     b_h1 = tl.zeros([64, BV], dtype=tl.float32)
@@ -119,14 +122,12 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         v_new += (bos * H + i_h).to(tl.int64) * V   # v_new 中, 第多少个batch, 多少个head, v_new [B, T, H, V] -> [i_n: i_n + 1, t_i * BT: t_i* BT + BT, 1, BV] * NT
 
     if USE_INITIAL_STATE:
-        h0 = h0 + i_nh * K*V    # 第多少个nh 中, K,V的状态
+        h0 = h0 + i_nh * K*V
     if STORE_FINAL_STATE:
-        ht = ht + i_nh * K*V    # 第多少个nh中
+        ht = ht + i_nh * K*V
 
     # load initial state
     if USE_INITIAL_STATE:
-        # 返回 input tensor中，某个块的指针
-        # base(tensor), shape, strides, offsets, block_shape, order, _semantic=None
         p_h0_1 = tl.make_block_ptr(h0, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0))
         b_h1 += tl.load(p_h0_1, boundary_check=(0, 1)).to(tl.float32)
         if K > 64:
@@ -139,7 +140,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             p_h0_4 = tl.make_block_ptr(h0, (K, V), (V, 1), (192, i_v * BV), (64, BV), (1, 0))
             b_h4 += tl.load(p_h0_4, boundary_check=(0, 1)).to(tl.float32)
 
-    # main recurrence 从0 开始, 计算多少个chunk
+    # main recurrence
     for i_t in range(NT):
         p_h1 = tl.make_block_ptr(h + i_t * H*K*V, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0))
         tl.store(p_h1, b_h1.to(p_h1.dtype.element_ty), boundary_check=(0, 1))
@@ -153,12 +154,9 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             p_h4 = tl.make_block_ptr(h + i_t * H*K*V, (K, V), (V, 1), (192, i_v * BV), (64, BV), (1, 0))
             tl.store(p_h4, b_h4.to(p_h4.dtype.element_ty), boundary_check=(0, 1))
 
-        # 跳着读取 [T, K]
         p_w = tl.make_block_ptr(w, (T, K), (H*K, 1), (i_t * BT, 0), (BT, 64), (1, 0))
         b_w = tl.load(p_w, boundary_check=(0, 1))
-        # Prediction: proj = w * h
-        # 预测: proj = w * h
-        b_v = tl.dot(b_w, b_h1.to(b_w.dtype))   # fp32 out
+        b_v = tl.dot(b_w, b_h1.to(b_w.dtype))
         if K > 64:
             p_w = tl.make_block_ptr(w, (T, K), (H*K, 1), (i_t * BT, 64), (BT, 64), (1, 0))
             b_w = tl.load(p_w, boundary_check=(0, 1))
@@ -172,8 +170,6 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             b_w = tl.load(p_w, boundary_check=(0, 1))
             b_v += tl.dot(b_w, b_h4.to(b_w.dtype))
         p_v = tl.make_block_ptr(v, (T, V), (H*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-        # Residual: v_new = u - proj
-        # 残差: v_new = u - proj
         b_v = tl.load(p_v, boundary_check=(0, 1)) - b_v
 
         if SAVE_NEW_VALUE:
@@ -182,18 +178,16 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
 
         last_idx = min((i_t + 1) * BT, T) - 1
         if USE_G:
-            # Decay state h and residual v with gate g
-            # 使用门 g 衰减状态 h 和残差 v
             m_t = (i_t * BT + tl.arange(0, BT)) < T
             b_g_last = tl.load(g + bos * H + last_idx * H + i_h).to(tl.float32)
             p_g = tl.make_block_ptr(g + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
             b_g = tl.load(p_g, boundary_check=(0,)).to(tl.float32)
             if USE_EXP2:
-                b_v = b_v * tl.where(m_t, tl.math.exp2(b_g_last - b_g), 0)[:, None]
-                b_g_last = tl.math.exp2(b_g_last)
+                b_v = b_v * tl.where(m_t, exp2(b_g_last - b_g), 0)[:, None]
+                b_g_last = exp2(b_g_last)
             else:
-                b_v = b_v * tl.where(m_t, tl.math.exp(b_g_last - b_g), 0)[:, None]
-                b_g_last = tl.math.exp(b_g_last)
+                b_v = b_v * tl.where(m_t, exp(b_g_last - b_g), 0)[:, None]
+                b_g_last = exp(b_g_last)
             b_h1 *= b_g_last
             if K > 64:
                 b_h2 *= b_g_last
@@ -204,38 +198,34 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
 
         if USE_GK:
             o_k1 = tl.arange(0, 64)
-            # (i_n * T + last_idx) * H * K
             b_gk_last1 = tl.load(gk + (bos + last_idx) * H*K + i_h * K + o_k1, mask=(o_k1 < K), other=0.).to(tl.float32)
             if USE_EXP2:
-                b_h1 *= tl.math.exp2(b_gk_last1)[:, None]
+                b_h1 *= exp2(b_gk_last1)[:, None]
             else:
-                b_h1 *= tl.math.exp(b_gk_last1)[:, None]
+                b_h1 *= exp(b_gk_last1)[:, None]
             if K > 64:
                 o_k2 = 64 + o_k1
                 b_gk_last2 = tl.load(gk + (bos + last_idx) * H*K + i_h * K + o_k2, mask=(o_k2 < K), other=0.).to(tl.float32)
                 if USE_EXP2:
-                    b_h2 *= tl.math.exp2(b_gk_last2)[:, None]
+                    b_h2 *= exp2(b_gk_last2)[:, None]
                 else:
-                    b_h2 *= tl.math.exp(b_gk_last2)[:, None]
+                    b_h2 *= exp(b_gk_last2)[:, None]
             if K > 128:
                 o_k3 = 128 + o_k1
                 b_gk_last3 = tl.load(gk + (bos + last_idx) * H*K + i_h * K + o_k3, mask=(o_k3 < K), other=0.).to(tl.float32)
                 if USE_EXP2:
-                    b_h3 *= tl.math.exp2(b_gk_last3)[:, None]
+                    b_h3 *= exp2(b_gk_last3)[:, None]
                 else:
-                    b_h3 *= tl.math.exp(b_gk_last3)[:, None]
+                    b_h3 *= exp(b_gk_last3)[:, None]
             if K > 192:
                 o_k4 = 192 + o_k1
                 b_gk_last4 = tl.load(gk + (bos + last_idx) * H*K + i_h * K + o_k4, mask=(o_k4 < K), other=0.).to(tl.float32)
                 if USE_EXP2:
-                    b_h4 *= tl.math.exp2(b_gk_last4)[:, None]
+                    b_h4 *= exp2(b_gk_last4)[:, None]
                 else:
-                    b_h4 *= tl.math.exp(b_gk_last4)[:, None]
+                    b_h4 *= exp(b_gk_last4)[:, None]
         b_v = b_v.to(k.dtype.element_ty)
 
-        # Update: h += k^T * v_new
-        # 更新: h += k^T * v_new
-        # 取 [T, K]^t * NT
         p_k = tl.make_block_ptr(k, (K, T), (1, H*K), (0, i_t * BT), (64, BT), (0, 1))
         b_k = tl.load(p_k, boundary_check=(0, 1))
         b_h1 += tl.dot(b_k, b_v)
@@ -559,20 +549,25 @@ def chunk_gated_delta_rule_fwd_h(
     B, T, H, K, V = *k.shape, u.shape[-1]
     BT = chunk_size
 
-    NT = triton.cdiv(T, BT)
-
+    if chunk_indices is None and cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
+    # N: the actual number of sequences in the batch with either equal or variable lengths
+    if cu_seqlens is None:
+        N, NT, chunk_offsets = B, triton.cdiv(T, BT), None
+    else:
+        N, NT, chunk_offsets = len(cu_seqlens) - 1, len(chunk_indices), prepare_chunk_offsets(cu_seqlens, BT)
     assert K <= 256, "current kernel does not support head dimension larger than 256."
 
-    # h 代表了 chunk内 局部的状态
     h = k.new_empty(B, NT, H, K, V)
-
-    final_state = k.new_empty(B, H, K, V, dtype=torch.float32) if output_final_state else None
+    # Ensure final output is zeros
+    # vLLM will use padding for CUDA Graph
+    final_state = k.new_zeros(N, H, K, V, dtype=torch.float32) if output_final_state else None
 
     v_new = torch.empty_like(u) if save_new_value else None
-
     # for BV in [32, 64]
     # chunk 内部的大小 ？
     BV = 64
+    # def grid(meta): return (triton.cdiv(V, meta['BV']), N*H)
     def grid(meta): return (triton.cdiv(V, BV), B * H)
     print("BH = ", B*H)
     print("BV = ", BV)
@@ -587,16 +582,14 @@ def chunk_gated_delta_rule_fwd_h(
         h=h,
         h0=initial_state,
         ht=final_state,
-        cu_seqlens=None,
-        chunk_offsets=None,
-        T=T,    # tl.constexpr
-        NT=NT,  # tl.constexpr
-        H=H,    # tl.constexpr
-        K=K,    # tl.constexpr
-        V=V,    # tl.constexpr
-        BT=BT,  # tl.constexpr
-        BV=BV,  # tl.constexpr
-        USE_EXP2=use_exp2,  # tl.constexpr
+        cu_seqlens=cu_seqlens,
+        chunk_offsets=chunk_offsets,
+        T=T,
+        H=H,
+        K=K,
+        V=V,
+        BT=BT,
+        USE_EXP2=use_exp2,
     )
     return h, v_new, final_state
 
