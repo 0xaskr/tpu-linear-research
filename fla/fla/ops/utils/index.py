@@ -117,7 +117,7 @@ def prepare_chunk_indices(
     """
     Generate chunk indices for variable length sequences.
     为变长序列生成分块索引。
-    
+
     Returns:
         torch.LongTensor: A tensor of shape [Num_Total_Chunks, 2].
         Each row is (sequence_id, chunk_id).
@@ -132,7 +132,8 @@ def prepare_chunk_indices(
         # indices.eq(0) finds where chunk_id resets to 0 (start of new sequence)
         # cumsum counts these resets to get sequence_id
         return torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1).to(cu_seqlens)
-    
+
+    # prepare_lens = torch.diff
     indices = torch.cat([torch.arange(n) for n in triton.cdiv(prepare_lens(cu_seqlens), chunk_size).tolist()])
     # 这个函数只生成逻辑上的 (Seq_ID, Chunk_ID) 对，不涉及实际数据的读取。
     # 越界保护机制 (Boundary Check):

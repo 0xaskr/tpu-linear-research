@@ -241,10 +241,96 @@ def run_comparison():
         compare_tensor("Residual (v_new)", v_new_ref, v_new_jax, atol=1e-2, rtol=1e-2)
         compare_tensor("Final State (ht)", final_state_ref, final_state_jax, atol=1e-2, rtol=1e-2)
 
+def run_comparison_varlen():
+    print("\n" + "="*40)
+    print("Running Varlen Comparison (chunk_gated_delta_rule_fwd_h)")
+    print("="*40)
+
+    try:
+        from fla.ops.utils import prepare_chunk_indices
+    except ImportError:
+        print("Could not import prepare_chunk_indices, skipping varlen test.")
+        return
+
+    B_real = 3
+    seqlens_list = [13, 33, 20]
+    TotalT = sum(seqlens_list)
+    H, K, V = 4, 64, 64
+    chunk_size = 32
+
+    rng_dtype = torch.bfloat16
+    tirton_dtype = torch.float32
+    pallas_dtype = jnp.bfloat16
+
+    print(f"B={B_real}, Seqlens={seqlens_list}, TotalT={TotalT}, H={H}, K={K}, V={V}, chunk_size={chunk_size}")
+
+    torch.manual_seed(42)
+    # Packed inputs [1, TotalT, ...] for Triton
+    k = torch.randn((1, TotalT, H, K), dtype=rng_dtype)
+    w = torch.randn((1, TotalT, H, K), dtype=rng_dtype)
+    u = torch.randn((1, TotalT, H, V), dtype=rng_dtype)
+    # g should be cumulative log decay to avoid explosion
+    raw_g = torch.randn((1, TotalT, H), dtype=torch.float32)
+    g = -raw_g.abs().cumsum(1) * 0.1
+    g = g.to(rng_dtype)
+    gk = torch.randn((1, TotalT, H, K), dtype=rng_dtype)
+    h0 = torch.randn((B_real, H, K, V), dtype=rng_dtype)
+
+    cu_seqlens = torch.tensor([0] + list(np.cumsum(seqlens_list)), dtype=torch.int32)
+
+    # Triton Run
+    if triton_fwd is not None:
+        print("Running Triton varlen...")
+        k_pt = k.to(tirton_dtype)
+        w_pt = w.to(tirton_dtype)
+        u_pt = u.to(tirton_dtype)
+        g_pt = g.to(tirton_dtype)
+        gk_pt = gk.to(tirton_dtype)
+        h0_pt = h0.to(tirton_dtype)
+        cu_seqlens_pt = cu_seqlens.to(torch.int32)
+
+        h_ref, v_new_ref, final_state_ref = triton_fwd(
+            k=k_pt, w=w_pt, u=u_pt, g=g_pt, gk=gk_pt,
+            initial_state=h0_pt, output_final_state=True,
+            chunk_size=chunk_size, save_new_value=True,
+            cu_seqlens=cu_seqlens_pt,
+            use_exp2=False
+        )
+        print(f"Triton h_ref shape: {h_ref.shape}")
+    else:
+        h_ref = None
+
+    # Pallas Run
+    if pallas_fwd is not None:
+        print("Running Pallas varlen...")
+        # Pallas wrapper expects [TotalT, H, K] (3D) to trigger Packed logic
+        k_jax = jnp.array(k.squeeze(0).to(torch.float32), dtype=pallas_dtype)
+        w_jax = jnp.array(w.squeeze(0).to(torch.float32), dtype=pallas_dtype)
+        u_jax = jnp.array(u.squeeze(0).to(torch.float32), dtype=pallas_dtype)
+        g_jax = jnp.array(g.squeeze(0).to(torch.float32), dtype=pallas_dtype)
+        gk_jax = jnp.array(gk.squeeze(0).to(torch.float32), dtype=pallas_dtype)
+        h0_jax = jnp.array(h0.to(torch.float32), dtype=pallas_dtype)
+        cu_seqlens_jax = jnp.array(cu_seqlens.numpy(), dtype=jnp.int32)
+
+        h_jax, v_new_jax, final_state_jax = pallas_fwd(
+            k=k_jax, w=w_jax, u=u_jax, g=g_jax, gk=gk_jax,
+            initial_state=h0_jax, output_final_state=True,
+            chunk_size=chunk_size, save_new_value=True,
+            cu_seqlens=cu_seqlens_jax,
+            use_exp2=False
+        )
+        jax.block_until_ready(h_jax)
+        print(f"Pallas h_jax shape: {h_jax.shape}")
+
+        if final_state_ref is not None:
+            compare_tensor("Final State (ht) Varlen", final_state_ref, final_state_jax, atol=1e-2, rtol=1e-2)
 
 if __name__ == "__main__":
     # run_comparison()
 
     # Run o_gk comparison
-    run_comparison_o_gk()
+    # run_comparison_o_gk()
+
+    # Run varlen comparison
+    run_comparison_varlen()
 
