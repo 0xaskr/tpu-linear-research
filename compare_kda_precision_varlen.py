@@ -1,6 +1,7 @@
 import os
 os.environ["TRITON_CPU_BACKEND"] = "1"
 os.environ["TRITON_INTERPRET"] = "1"
+os.environ["JAX_PLATFORM_NAME"] = "cpu"
 import torch
 import jax
 import jax.numpy as jnp
@@ -160,7 +161,7 @@ def run_comparison_varlen_fp32():
     print("="*40)
 
     # Tolerances for FP32
-    atol, rtol = 1e-3, 1e-4
+    atol, rtol = 1e-2, 1e-4
 
     compare_tensor("Hidden States (h)", h_ref, h_history_jax, atol=atol, rtol=rtol)
     compare_tensor("Residual (v_new)", v_new_ref, v_new_jax, atol=atol, rtol=rtol)

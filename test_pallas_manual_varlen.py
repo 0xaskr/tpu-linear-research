@@ -130,19 +130,19 @@ def chunk_gated_delta_rule_fwd_kernel_varlen(
 
     b_w = w_ref[0, pl.ds(bos + idx_t * BT, BT), idx_h, 0:64]
     b_w = jnp.where(m_t[:, None], b_w, 0)
-    b_v = jnp.dot(b_w, b_h1.astype(b_w.dtype), precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
+    b_v = jnp.dot(b_w.astype(jnp.float32), b_h1, precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
     if K > 64:
       b_w2 = w_ref[0, pl.ds(bos + idx_t * BT, BT), idx_h, 64:128]
       b_w2 = jnp.where(m_t[:, None], b_w2, 0)
-      b_v += jnp.dot(b_w2, b_h2.astype(b_w2.dtype), preferred_element_type=jnp.float32)
+      b_v += jnp.dot(b_w2.astype(jnp.float32), b_h2, preferred_element_type=jnp.float32)
     if K > 128:
       b_w3 = w_ref[0, pl.ds(bos + idx_t * BT, BT), idx_h, 128:192]
       b_w3 = jnp.where(m_t[:, None], b_w3, 0)
-      b_v += jnp.dot(b_w3, b_h3.astype(b_w3.dtype), preferred_element_type=jnp.float32)
+      b_v += jnp.dot(b_w3.astype(jnp.float32), b_h3, preferred_element_type=jnp.float32)
     if K > 192:
       b_w4 = w_ref[0, pl.ds(bos + idx_t * BT, BT), idx_h, 192:256]
       b_w4 = jnp.where(m_t[:, None], b_w4, 0)
-      b_v += jnp.dot(b_w4, b_h4.astype(b_w4.dtype), preferred_element_type=jnp.float32)
+      b_v += jnp.dot(b_w4.astype(jnp.float32), b_h4, preferred_element_type=jnp.float32)
 
     b_v_raw = v_ref[0, pl.ds(bos + idx_t * BT, BT), idx_h, pl.ds(idx_v * BV, BV)].astype(b_v.dtype)
     b_v_raw = jnp.where(m_t[:, None], b_v_raw, 0)
@@ -255,6 +255,21 @@ def chunk_gated_delta_rule_fwd_h_varlen(
     chunk_indices: jax.Array | None = None,
     use_exp2: bool = False,
 ):
+  # Pad inputs to multiple of chunk_size to avoid OOB dynamic_slice shifting in Pallas/JAX
+  # This serves as a correctness fix for the Last Sequence when TotalT % chunk_size != 0
+  original_T = k.shape[1]
+  remainder = original_T % chunk_size
+  if remainder > 0:
+      pad_len = chunk_size - remainder
+      pad_width = ((0, 0), (0, pad_len), (0, 0), (0, 0))
+      k = jnp.pad(k, pad_width)
+      w = jnp.pad(w, pad_width)
+      u = jnp.pad(u, pad_width)
+      if g is not None:
+          g = jnp.pad(g, ((0, 0), (0, pad_len), (0, 0)))
+      if gk is not None:
+          gk = jnp.pad(gk, pad_width)
+
   B, T, H, K, V = *k.shape, u.shape[-1]
   BT = chunk_size
 
@@ -295,8 +310,6 @@ def chunk_gated_delta_rule_fwd_h_varlen(
   h_spec = jax.ShapeDtypeStruct(h.shape, h.dtype)
   v_new_spec = jax.ShapeDtypeStruct([B, T, H, V], u.dtype)
   final_state_spec = jax.ShapeDtypeStruct([N, H, K, V], jnp.float32)
-
-  total_t = B * T
 
   k_blockspec = pl.BlockSpec([B, T, H, K], index_map = lambda v, bh: (0, 0, 0, 0))
   u_blockspec = pl.BlockSpec([B, T, H, V], index_map = lambda v, bh: (0, 0, 0, 0))
@@ -342,6 +355,9 @@ def chunk_gated_delta_rule_fwd_h_varlen(
     out_specs=[h_blockspec, v_new_blockspec, final_out_blockspec],
     interpret=True
   )(k, u, w, g_fp32, gk_fp32, initial_state, seqlens, chunk_offsets)
+
+  if save_new_value and v_out is not None and remainder > 0:
+      v_out = v_out[:, :original_T, :, :]
 
   return h, (v_out if save_new_value else None), (final_out if output_final_state else None)
 
