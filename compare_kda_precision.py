@@ -161,7 +161,7 @@ def run_comparison_o_gk():
     compare_tensor("Output (o) - FULL", o_ref, o_jax, atol=1e-2, rtol=1e-2)
 
 def run_comparison():
-    B, T, H, K, V = 2, 64, 4, 64, 64
+    B, T, H, K, V = 2, 128, 4, 64, 64
     chunk_size = 64
     use_exp2 = False
     rng_dtype = torch.bfloat16
@@ -326,11 +326,11 @@ def run_comparison_varlen():
             compare_tensor("Final State (ht) Varlen", final_state_ref, final_state_jax, atol=1e-2, rtol=1e-2)
 
 if __name__ == "__main__":
-    # run_comparison()
+    run_comparison()
 
     # Run o_gk comparison
-    # run_comparison_o_gk()
+    run_comparison_o_gk()
 
     # Run varlen comparison
-    run_comparison_varlen()
+    # run_comparison_varlen()
 
