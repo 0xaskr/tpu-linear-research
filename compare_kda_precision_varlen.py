@@ -1,7 +1,6 @@
 import os
 os.environ["TRITON_CPU_BACKEND"] = "1"
 os.environ["TRITON_INTERPRET"] = "1"
-os.environ["JAX_PLATFORM_NAME"] = "cpu"
 import torch
 import jax
 import jax.numpy as jnp
@@ -83,7 +82,7 @@ def run_comparison_varlen_fp32():
     # Configuration
     rng_dtype = torch.bfloat16
     triton_dtype = torch.float32
-    jax_dtype = jnp.bfloat16
+    jax_dtype = jnp.float32
 
     seqlens_list = [64, 128, 64]
     N = len(seqlens_list)
@@ -124,7 +123,7 @@ def run_comparison_varlen_fp32():
     # Triton Run
     print("\nRunning Triton varlen (FP32)...")
     h_ref, v_new_ref, final_state_ref = triton_fwd(
-        k=k_pt, w=w_pt, u=u_pt, g=g_pt, gk=gk_pt,
+        k=k_pt, w=w_pt, u=u_pt, g=None, gk=None,
         initial_state=h0_pt, output_final_state=True,
         chunk_size=chunk_size, save_new_value=True,
         cu_seqlens=cu_seqlens.long(),
@@ -146,7 +145,7 @@ def run_comparison_varlen_fp32():
     chunk_indices_jax = jnp.array(chunk_indices.numpy(), dtype=jnp.int32)
 
     h_history_jax, v_new_jax, final_state_jax = pallas_fwd(
-        k=k_jax, w=w_jax, u=u_jax, g=g_jax, gk=gk_jax,
+        k=k_jax, w=w_jax, u=u_jax, g=None, gk=None,
         initial_state=h0_jax, output_final_state=True,
         chunk_size=chunk_size, save_new_value=True,
         seqlens=cu_seqlens_jax,

@@ -1,4 +1,5 @@
 from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 import jax
 import functools
@@ -12,8 +13,24 @@ def cdiv(a: jax.Array, b: jax.Array | int):
 def cdiv_pt(a, b):
   return (a + b - 1) // b
 
+def AlignUP(a, b):
+  return (a + b - 1) // b * b
+
 def prepare_chunk_offsets(seqlens: jax.Array, chunk_size:int):
-  return jnp.pad(cdiv(jnp.diff(seqlens), chunk_size), (1, 0), constant_values=0).cumsum(-1)
+  return jnp.pad(cdiv(jnp.diff(seqlens), chunk_size).astype(jnp.int32), (1, 0), constant_values=0).cumsum(-1)
+
+def pad_to_multiple(x: jax.Array, multiple: int, axis: int, val):
+  if multiple <= 1:
+    return x
+  shape = list(x.shape)
+  length = shape[axis]
+  remainder = length % multiple
+  if remainder == 0:
+    return x
+  pad_len = multiple - remainder
+  pad_width = [(0, 0)] * len(shape)
+  pad_width[axis] = (0, pad_len)
+  return jnp.pad(x, pad_width, constant_values=val)
 
 def prepare_chunk_indices(
     cu_seqlens: torch.Tensor,
@@ -52,18 +69,18 @@ def prepare_chunk_indices(
 
 # TODO(0xaskr) need pad
 def chunk_gated_delta_rule_fwd_kernel_varlen(
-    k_ref,      # [B, T, H, K]
-    v_ref,      # [B, T, H, V]
-    w_ref,      # [B, T, H, K]
+    k_ref,      # [H, B, T, K_PADED // 128, 128]
+    v_ref,      # [H, B, T, V // 64, 2, 256]
+    w_ref,      # [H, B, T, K_PADED // 128, 128]
     g_ref,      # [B, T, H]
     gk_ref,     # [B, T, H, K]
-    h0_ref,     # [B, H, K, V]
+    h0_ref,     # [N, H, V, K]
     seqlens_ref,# [N + 1]
     chunk_offsets_ref, # [N + 1]
 
     # output
-    h_ref,      # [N, NT, H, K, V]
-    v_new_ref,  # [B, T, H, BV]
+    h_ref,      # [N, NT, H, V, K]
+    v_new_ref,  # [H, B, T, V// 64, 2, 256]
     ht_ref,     # [1, H, K, BV]
 
     T,
@@ -107,49 +124,58 @@ def chunk_gated_delta_rule_fwd_kernel_varlen(
   #   v_new + =
 
   if USE_INITIAL_STATE:
-    b_h1 += h0_ref[idx_n, idx_h, 0:64, pl.ds(idx_v * BV, BV)].astype(jnp.float32)
-    if K > 64:
-      b_h2 += h0_ref[idx_n, idx_h, 64:128, pl.ds(idx_v * BV, BV)].astype(jnp.float32)
-    if K > 128:
-      b_h3 += h0_ref[idx_n, idx_h, 128:192, pl.ds(idx_v * BV, BV)].astype(jnp.float32)
-    if K > 192:
-      b_h4 += h0_ref[idx_n, idx_h, 192:256, pl.ds(idx_v * BV, BV)].astype(jnp.float32)
+    h0_arr = h0_ref[idx_n, idx_h, pl.ds(idx_v * BV, BV), :].astype(jnp.float32)
+    h0_arr = h0_arr[:, 0:64].transpose(1, 0)
+    # b_h1 += h0_ref[idx_n, idx_h, 0:64, pl.ds(idx_v * BV, BV)].astype(jnp.float32)
+    b_h1 += h0_arr
+    # if K > 64:
+    #   b_h2 += h0_ref[idx_n, idx_h, 64:128, pl.ds(idx_v * BV, BV)].astype(jnp.float32)
+    # if K > 128:
+    #   b_h3 += h0_ref[idx_n, idx_h, 128:192, pl.ds(idx_v * BV, BV)].astype(jnp.float32)
+    # if K > 192:
+    #   b_h4 += h0_ref[idx_n, idx_h, 192:256, pl.ds(idx_v * BV, BV)].astype(jnp.float32)
 
   def loop_real_NT(idx_t, carry):
     b_h1, b_h2, b_h3, b_h4 = carry
-    h_ref[0, boh + idx_t, idx_h, 0:64, pl.ds(idx_v * BV, BV)] = b_h1.astype(h_ref.dtype)
-    if K > 64:
-      h_ref[0, boh + idx_t, idx_h, 64:128, pl.ds(idx_v * BV, BV)] = b_h2.astype(h_ref.dtype)
-    if K > 128:
-      h_ref[0, boh + idx_t, idx_h, 128:192, pl.ds(idx_v * BV, BV)] = b_h3.astype(h_ref.dtype)
-    if K > 192:
-      h_ref[0, boh + idx_t, idx_h, 192:256, pl.ds(idx_v * BV, BV)] = b_h4.astype(h_ref.dtype)
+    # h_ref[0, boh + idx_t, idx_h, 0:64, pl.ds(idx_v * BV, BV)] = b_h1.astype(h_ref.dtype)
+    h_ref[0, boh + idx_t, idx_h, pl.ds(idx_v * BV, BV), 0:64] = b_h1.astype(h_ref.dtype).transpose(1, 0)
+    # if K > 64:
+    #   h_ref[0, boh + idx_t, idx_h, 64:128, pl.ds(idx_v * BV, BV)] = b_h2.astype(h_ref.dtype)
+    # if K > 128:
+    #   h_ref[0, boh + idx_t, idx_h, 128:192, pl.ds(idx_v * BV, BV)] = b_h3.astype(h_ref.dtype)
+    # if K > 192:
+    #   h_ref[0, boh + idx_t, idx_h, 192:256, pl.ds(idx_v * BV, BV)] = b_h4.astype(h_ref.dtype)
 
 
     m_t = (idx_t * BT + jnp.arange(0, BT)) < real_T
+    m_t_2d = m_t.astype(jnp.int32)[:,None].astype(jnp.bool)
 
-    b_w = w_ref[0, pl.ds(bos + idx_t * BT, BT), idx_h, 0:64]
-    b_w = jnp.where(m_t[:, None], b_w, 0)
+    # b_w = w_ref[0, pl.ds(bos + idx_t * BT, BT), idx_h, 0:64]
+    w_tmp = w_ref[idx_h, 0, pl.ds(bos + idx_t * BT, BT), 0, :]
+    b_w = w_tmp[:, 0:64]
+    b_w = jnp.where(m_t_2d, b_w, 0)
     b_v = jnp.dot(b_w.astype(jnp.float32), b_h1, precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
-    if K > 64:
-      b_w2 = w_ref[0, pl.ds(bos + idx_t * BT, BT), idx_h, 64:128]
-      b_w2 = jnp.where(m_t[:, None], b_w2, 0)
-      b_v += jnp.dot(b_w2.astype(jnp.float32), b_h2, preferred_element_type=jnp.float32)
-    if K > 128:
-      b_w3 = w_ref[0, pl.ds(bos + idx_t * BT, BT), idx_h, 128:192]
-      b_w3 = jnp.where(m_t[:, None], b_w3, 0)
-      b_v += jnp.dot(b_w3.astype(jnp.float32), b_h3, preferred_element_type=jnp.float32)
-    if K > 192:
-      b_w4 = w_ref[0, pl.ds(bos + idx_t * BT, BT), idx_h, 192:256]
-      b_w4 = jnp.where(m_t[:, None], b_w4, 0)
-      b_v += jnp.dot(b_w4.astype(jnp.float32), b_h4, preferred_element_type=jnp.float32)
+    # if K > 64:
+    #   b_w2 = w_ref[0, pl.ds(bos + idx_t * BT, BT), idx_h, 64:128]
+    #   b_w2 = jnp.where(m_t[:, None], b_w2, 0)
+    #   b_v += jnp.dot(b_w2.astype(jnp.float32), b_h2, preferred_element_type=jnp.float32)
+    # if K > 128:
+    #   b_w3 = w_ref[0, pl.ds(bos + idx_t * BT, BT), idx_h, 128:192]
+    #   b_w3 = jnp.where(m_t[:, None], b_w3, 0)
+    #   b_v += jnp.dot(b_w3.astype(jnp.float32), b_h3, preferred_element_type=jnp.float32)
+    # if K > 192:
+    #   b_w4 = w_ref[0, pl.ds(bos + idx_t * BT, BT), idx_h, 192:256]
+    #   b_w4 = jnp.where(m_t[:, None], b_w4, 0)
+    #   b_v += jnp.dot(b_w4.astype(jnp.float32), b_h4, preferred_element_type=jnp.float32)
 
-    b_v_raw = v_ref[0, pl.ds(bos + idx_t * BT, BT), idx_h, pl.ds(idx_v * BV, BV)].astype(b_v.dtype)
-    b_v_raw = jnp.where(m_t[:, None], b_v_raw, 0)
+    b_v_raw = v_ref[idx_h, 0, pl.ds(bos + idx_t * BT, BT), pl.ds(idx_v, 1), 0, :].astype(b_v.dtype)
+    b_v_raw = b_v_raw.reshape(BT, 256)[:, 0:BV]
+    print("b_v_raw.shape = ", b_v_raw.shape)
+    b_v_raw = jnp.where(m_t_2d, b_v_raw, 0)
     b_v = b_v_raw - b_v
 
     if SAVE_NEW_VALUE:
-      v_new_ref[0, pl.ds(bos + idx_t * BT, BT), idx_h, pl.ds(idx_v * BV, BV)] = b_v.astype(v_new_ref.dtype)
+      v_new_ref[idx_h, 0, pl.ds(bos + idx_t * BT, BT), idx_v, :, :] = pad_to_multiple(b_v, 512, -1, 0).reshape(BT, 2, 256).astype(v_new_ref.dtype)
 
     last_idx = jnp.minimum((idx_t + 1) * BT, real_T) - 1
 
@@ -176,7 +202,7 @@ def chunk_gated_delta_rule_fwd_kernel_varlen(
     if USE_GK:
       o_k1 = jnp.arange(0, 64)
       b_gk_last1 = jnp.where(o_k1 < K,
-                      gk_ref[0, bos + last_idx, idx_h, o_k1],
+                      gk_ref[0, bos + last_idx, idx_h, 0:64],
                       0
                     ).astype(jnp.float32)
       if USE_EXP2:
@@ -186,7 +212,7 @@ def chunk_gated_delta_rule_fwd_kernel_varlen(
 
       if K > 64:
         o_k2 = 64 + o_k1
-        b_gk_last2 = jnp.where(o_k2 < K, gk_ref[0, bos + last_idx, idx_h, o_k2], 0).astype(jnp.float32)
+        b_gk_last2 = jnp.where(o_k2 < K, gk_ref[0, bos + last_idx, idx_h, 64:128], 0).astype(jnp.float32)
         if USE_EXP2:
           b_h2 *= jnp.exp2(b_gk_last2)[:, None]
         else:
@@ -194,7 +220,7 @@ def chunk_gated_delta_rule_fwd_kernel_varlen(
 
       if K > 128:
         o_k3 = 128 + o_k1
-        b_gk_last3 = jnp.where(o_k3 < K, gk_ref[0, bos + last_idx, idx_h, o_k3], 0).astype(jnp.float32)
+        b_gk_last3 = jnp.where(o_k3 < K, gk_ref[0, bos + last_idx, idx_h, 128:192], 0).astype(jnp.float32)
         if USE_EXP2:
           b_h3 *= jnp.exp2(b_gk_last3)[:, None]
         else:
@@ -202,7 +228,7 @@ def chunk_gated_delta_rule_fwd_kernel_varlen(
 
       if K > 192:
         o_k4 = 192 + o_k1
-        b_gk_last4 = jnp.where(o_k4 < K, gk_ref[0, bos + last_idx, idx_h, o_k4], 0).astype(jnp.float32)
+        b_gk_last4 = jnp.where(o_k4 < K, gk_ref[0, bos + last_idx, idx_h, 192:256], 0).astype(jnp.float32)
         if USE_EXP2:
           b_h4 *= jnp.exp2(b_gk_last4)[:, None]
         else:
@@ -211,20 +237,22 @@ def chunk_gated_delta_rule_fwd_kernel_varlen(
     # b_v = b_v.astype(k_ref.dtype)
 
     b_k = k_ref[0, pl.ds(bos + idx_t * BT, BT), idx_h, 0:64]
-    b_k = jnp.where(m_t[:, None], b_k, 0).reshape(BT, 64).transpose(1, 0)
+    b_k = k_ref[idx_h, 0, pl.ds(bos + idx_t * BT, BT), 0, :]
+    b_k = b_k[:, 0:64]
+    b_k = jnp.where(m_t_2d, b_k, 0).reshape(BT, 64).transpose(1, 0)
     b_h1 += jnp.dot(b_k.astype(jnp.float32), b_v.astype(jnp.float32), precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
-    if K > 64:
-      b_k2 = k_ref[0, pl.ds(bos + idx_t * BT, BT), idx_h, 64:128]
-      b_k2 = jnp.where(m_t[:, None], b_k2, 0).reshape(BT, 64).transpose(1, 0)
-      b_h2 += jnp.dot(b_k2.astype(jnp.float32), b_v.astype(jnp.float32), precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
-    if K > 128:
-      b_k3 = k_ref[0, pl.ds(bos + idx_t * BT, BT), idx_h, 128:192]
-      b_k3 = jnp.where(m_t[:, None], b_k3, 0).reshape(BT, 64).transpose(1, 0)
-      b_h3 += jnp.dot(b_k3.astype(jnp.float32), b_v.astype(jnp.float32), precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
-    if K > 192:
-      b_k4 = k_ref[0, pl.ds(bos + idx_t * BT, BT), idx_h, 192:256]
-      b_k4 = jnp.where(m_t[:, None], b_k4, 0).reshape(BT, 64).transpose(1, 0)
-      b_h4 += jnp.dot(b_k4.astype(jnp.float32), b_v.astype(jnp.float32), precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
+    # if K > 64:
+    #   b_k2 = k_ref[0, pl.ds(bos + idx_t * BT, BT), idx_h, 64:128]
+    #   b_k2 = jnp.where(m_t[:, None], b_k2, 0).reshape(BT, 64).transpose(1, 0)
+    #   b_h2 += jnp.dot(b_k2.astype(jnp.float32), b_v.astype(jnp.float32), precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
+    # if K > 128:
+    #   b_k3 = k_ref[0, pl.ds(bos + idx_t * BT, BT), idx_h, 128:192]
+    #   b_k3 = jnp.where(m_t[:, None], b_k3, 0).reshape(BT, 64).transpose(1, 0)
+    #   b_h3 += jnp.dot(b_k3.astype(jnp.float32), b_v.astype(jnp.float32), precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
+    # if K > 192:
+    #   b_k4 = k_ref[0, pl.ds(bos + idx_t * BT, BT), idx_h, 192:256]
+    #   b_k4 = jnp.where(m_t[:, None], b_k4, 0).reshape(BT, 64).transpose(1, 0)
+    #   b_h4 += jnp.dot(b_k4.astype(jnp.float32), b_v.astype(jnp.float32), precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
 
     return b_h1, b_h2, b_h3, b_h4
 
@@ -244,7 +272,7 @@ def chunk_gated_delta_rule_fwd_kernel_varlen(
 def chunk_gated_delta_rule_fwd_h_varlen(
     k: jax.Array,
     w: jax.Array,
-    u: jax.Array,
+    v: jax.Array,
     g: jax.Array | None = None,
     gk: jax.Array | None = None,
     initial_state: jax.Array | None = None,
@@ -255,48 +283,58 @@ def chunk_gated_delta_rule_fwd_h_varlen(
     chunk_indices: jax.Array | None = None,
     use_exp2: bool = False,
 ):
-  # Pad inputs to multiple of chunk_size to avoid OOB dynamic_slice shifting in Pallas/JAX
-  # This serves as a correctness fix for the Last Sequence when TotalT % chunk_size != 0
-  original_T = k.shape[1]
-  remainder = original_T % chunk_size
-  if remainder > 0:
-      pad_len = chunk_size - remainder
-      pad_width = ((0, 0), (0, pad_len), (0, 0), (0, 0))
-      k = jnp.pad(k, pad_width)
-      w = jnp.pad(w, pad_width)
-      u = jnp.pad(u, pad_width)
-      if g is not None:
-          g = jnp.pad(g, ((0, 0), (0, pad_len), (0, 0)))
-      if gk is not None:
-          gk = jnp.pad(gk, pad_width)
 
-  B, T, H, K, V = *k.shape, u.shape[-1]
+  B, T, H, K, V = *k.shape, v.shape[-1]
   BT = chunk_size
+  BV = 64   # auto tune
+  K_BPE = k.dtype.itemsize
+  W_BPE = w.dtype.itemsize
+  V_BPE = v.dtype.itemsize
+  K_PADSIZE = int(AlignUP(K, 512 / K_BPE))
+  # V_PADSIZE = int(AlignUP(V, 512 / V_BPE))
 
+  assert ((seqlens == None) or (seqlens != None and chunk_indices != None))
+  assert K <= 256, "current kernel does not support head dimension larger than 256."
+  assert k.shape == (B, T, H, K)
+  assert w.shape == (B, T, H, K)
+  assert v.shape == (B, T, H, V)
+  assert ((seqlens == None) or (seqlens != None and B == 1))
+  assert ((g is None) or (g.shape == (B, T, H)))
+  assert ((gk is None) or (gk.shape == (B, T, H, K)))
   if seqlens is None:
     N, NT, chunk_offsets = B, math.ceil(T / BT), None
   else:
     N, NT, chunk_offsets = len(seqlens) - 1, len(chunk_indices), prepare_chunk_offsets(seqlens, BT)
+  assert ((initial_state is None) or (initial_state.shape == (N, H, K, V)))
 
-  print("chunk_offsets = ", chunk_offsets)
-  assert (seqlens == None or (seqlens != None and chunk_indices != None))
-  assert K <= 256, "current kernel does not support head dimension larger than 256."
-  assert k.shape == (B, T, H, K)
-  assert w.shape == (B, T, H, K)
-  assert u.shape == (B, T, H, V)
-  assert (seqlens == None or (seqlens != None and B == 1))
-
-  if g is not None:
-    assert g.shape == (B, T, H)
-  if gk is not None:
-    assert gk.shape == (B, T, H, K)
-  if (initial_state is not None):
-     assert initial_state.shape == (N, H, K, V)
+  if initial_state is not None:
+    initial_state = initial_state.transpose(0, 1, 3, 2)
+    # [N, H, K, V] -> [N, H, V, K]
 
 
-  h = jnp.zeros([B, NT, H, K, V], dtype=k.dtype)
-  v_new = jnp.zeros_like(u) if save_new_value else None
-  final_state = jnp.zeros((N, H, K, V), dtype=jnp.float32) if output_final_state else None
+  # [B, T, H, K] -> [H, B, T, K_PADSIZE] -> [H, B, T, K_PADSIZE // 128, 128]
+  k_paded = pad_to_multiple(k, 512 // K_BPE, -1, 0)
+  k_paded = k_paded.transpose(2, 0, 1, 3)
+  k_paded = k_paded.reshape(H, B, T, -1, 128)
+
+  # [B, T, H, K] -> [H, B, T, K_PADSIZE] -> [H, B, T, K_PADSIZE // 128, 128]
+  w_paded = pad_to_multiple(w, 512 // W_BPE, -1, 0)
+  w_paded = w_paded.transpose(2, 0, 1, 3)
+  w_paded = w_paded.reshape(H, B, T, -1, 128)
+
+  # [B, T, H, V] -> [H, B, T, V] -> [B, T, H, V_PADSIZE]
+  # -> [B, T, H, V_PADSIZE//BV, BV]
+  v_paded = v.transpose(2, 0, 1, 3)
+  v_paded = pad_to_multiple(v_paded, BV, -1, 0)
+  v_paded = v_paded.reshape(B, T, H, -1, BV)
+
+  h_shape = [B, NT, H, K, V]
+  v_new_shape = [B, T, H, V]
+  final_state_shape = [N, H, K, V]
+  h = jnp.zeros(h_shape, dtype=k.dtype)
+  v_new = jnp.zeros(v_new_shape, dtype=v.dtype) if save_new_value else None
+  final_state = jnp.zeros(final_state_shape, dtype=jnp.float32) if output_final_state else None
+
   if g is not None:
     g_fp32 = g.astype(jnp.float32)
   else:
@@ -307,25 +345,23 @@ def chunk_gated_delta_rule_fwd_h_varlen(
   else:
     gk_fp32 = None
 
-  h_spec = jax.ShapeDtypeStruct(h.shape, h.dtype)
-  v_new_spec = jax.ShapeDtypeStruct([B, T, H, V], u.dtype)
-  final_state_spec = jax.ShapeDtypeStruct([N, H, K, V], jnp.float32)
+  h_spec = jax.ShapeDtypeStruct(h_shape, h.dtype)
+  v_new_spec = jax.ShapeDtypeStruct(v_new_shape, v.dtype)
+  final_state_spec = jax.ShapeDtypeStruct(final_state_shape, jnp.float32)
 
-  k_blockspec = pl.BlockSpec([B, T, H, K], index_map = lambda v, bh: (0, 0, 0, 0))
-  u_blockspec = pl.BlockSpec([B, T, H, V], index_map = lambda v, bh: (0, 0, 0, 0))
-  w_blockspec = pl.BlockSpec([B, T, H, K], index_map = lambda v, bh: (0, 0, 0, 0))
+  k_blockspec = pl.BlockSpec([H, B, T, K_PADSIZE//128, 128], index_map = lambda v, bh: (0, 0, 0, 0, 0))
+  w_blockspec = pl.BlockSpec([H, B, T, K_PADSIZE//128, 128], index_map = lambda v, bh: (0, 0, 0, 0, 0))
+  v_blockspec = pl.BlockSpec([B, T, H, v_paded.shape[3], BV], index_map = lambda v, bh: (0, 0, 0, 0, 0))
   g_blockspec = pl.BlockSpec([B, T, H], index_map = lambda v, bh: (0, 0, 0))
   gk_blockspec = pl.BlockSpec([B, T, H, K], index_map = lambda v, bh: (0, 0, 0, 0))
   init_blockspec = pl.BlockSpec([N, H, K, V], index_map = lambda v, bh: (0, 0, 0, 0))
-  seqlens_blockspec = pl.BlockSpec([N + 1], index_map = lambda v, bh: (0,))
-  chunk_offsets_blockspec = pl.BlockSpec([N + 1], index_map = lambda v, bh: (0))
+  seqlens_blockspec = pl.BlockSpec([N + 1], index_map = lambda v, bh: (0,), memory_space = pltpu.MemorySpace.SMEM)
+  chunk_offsets_blockspec = pl.BlockSpec([N + 1], index_map = lambda v, bh: (0,), memory_space = pltpu.MemorySpace.SMEM)
 
   h_blockspec = pl.BlockSpec([B, NT, H, K, V], lambda v, bh : (0, 0, 0, 0, 0))
   v_new_blockspec = pl.BlockSpec([B, T, H, V], lambda v, bh : (0, 0, 0, 0))
   final_out_blockspec = pl.BlockSpec([N, H, K, V], lambda v, bh : (0, 0, 0, 0))
 
-  # auto tune BV = [32, 64]
-  BV = 64
   grid = (math.ceil(V / BV), N * H)
   h, v_out, final_out = pl.pallas_call(
     functools.partial(
@@ -346,18 +382,14 @@ def chunk_gated_delta_rule_fwd_h_varlen(
         IS_VARLEN=(seqlens is not None),
     ),
     grid=grid,
-    in_specs=[k_blockspec, u_blockspec, w_blockspec,
+    in_specs=[k_blockspec, v_blockspec, w_blockspec,
               g_blockspec if (g is not None) else None,
               gk_blockspec if (gk is not None) else None,
               init_blockspec if initial_state is not None else None,
               seqlens_blockspec, chunk_offsets_blockspec],
     out_shape=[h_spec, v_new_spec, final_state_spec],
     out_specs=[h_blockspec, v_new_blockspec, final_out_blockspec],
-    interpret=True
-  )(k, u, w, g_fp32, gk_fp32, initial_state, seqlens, chunk_offsets)
-
-  if save_new_value and v_out is not None and remainder > 0:
-      v_out = v_out[:, :original_T, :, :]
+  )(k_paded, v_paded, w_paded, g_fp32, gk_fp32, initial_state, seqlens, chunk_offsets)
 
   return h, (v_out if save_new_value else None), (final_out if output_final_state else None)
 
