@@ -145,7 +145,7 @@ def run_comparison_varlen_fp32():
     chunk_indices_jax = jnp.array(chunk_indices.numpy(), dtype=jnp.int32)
 
     h_history_jax, v_new_jax, final_state_jax = pallas_fwd(
-        k=k_jax, w=w_jax, u=u_jax, g=None, gk=None,
+        k=k_jax, w=w_jax, v=u_jax, g=None, gk=None,
         initial_state=h0_jax, output_final_state=True,
         chunk_size=chunk_size, save_new_value=True,
         seqlens=cu_seqlens_jax,
