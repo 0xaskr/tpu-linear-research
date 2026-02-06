@@ -67,12 +67,11 @@ def prepare_chunk_indices(
     # 因此，即使最后一个 Chunk 不满 (Partial Chunk)，Kernel 也会通过 Mask 防止越界。
     return torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1).to(cu_seqlens)
 
-# TODO(0xaskr) need pad
 def chunk_gated_delta_rule_fwd_kernel_varlen(
     k_ref,      # [H, B, T, K_PADSIZE // 128, 128]
     v_ref,      # [H, B, T, V_PADSIZE//BV, BV]
     w_ref,      # [H, B, T, K_PADSIZE // 128, 128]
-    g_ref,      # [B, T, H]
+    g_ref,      # [B, T, H, 128]
     gk_ref,     # [B, T, H, K]
     h0_ref,     # [N, H, V, K]
     seqlens_ref,# [N + 1]
@@ -120,137 +119,117 @@ def chunk_gated_delta_rule_fwd_kernel_varlen(
   b_h3 = jnp.zeros([64, BV], dtype=jnp.float32)
   b_h4 = jnp.zeros([64, BV], dtype=jnp.float32)
 
-  # if SAVE_NEW_VALUE:
-  #   v_new + =
-
   if USE_INITIAL_STATE:
     b_h1 += h0_ref[idx_n, idx_h, pl.ds(idx_v * BV, BV), 0:64].astype(jnp.float32).transpose(1, 0)
-    # b_h1 += h0_ref[idx_n, idx_h, 0:64, pl.ds(idx_v * BV, BV)].astype(jnp.float32)
-    # if K > 64:
-    #   b_h2 += h0_ref[idx_n, idx_h, 64:128, pl.ds(idx_v * BV, BV)].astype(jnp.float32)
-    # if K > 128:
-    #   b_h3 += h0_ref[idx_n, idx_h, 128:192, pl.ds(idx_v * BV, BV)].astype(jnp.float32)
-    # if K > 192:
-    #   b_h4 += h0_ref[idx_n, idx_h, 192:256, pl.ds(idx_v * BV, BV)].astype(jnp.float32)
+    if K > 64:
+      b_h2 += h0_ref[idx_n, idx_h, pl.ds(idx_v * BV, BV), 64:128].astype(jnp.float32).transpose(1, 0)
+    if K > 128:
+      b_h3 += h0_ref[idx_n, idx_h, pl.ds(idx_v * BV, BV), 128:192].astype(jnp.float32).transpose(1, 0)
+    if K > 192:
+      b_h4 += h0_ref[idx_n, idx_h, pl.ds(idx_v * BV, BV), 192:256].astype(jnp.float32).transpose(1, 0)
 
   def loop_real_NT(idx_t, carry):
     b_h1, b_h2, b_h3, b_h4 = carry
     h_ref[0, boh + idx_t, idx_h, pl.ds(idx_v * BV, BV), 0:64] = b_h1.astype(h_ref.dtype).transpose(1, 0)
-    # h_ref[0, boh + idx_t, idx_h, 0:64, pl.ds(idx_v * BV, BV)] = b_h1.astype(h_ref.dtype)
-    # if K > 64:
-    #   h_ref[0, boh + idx_t, idx_h, 64:128, pl.ds(idx_v * BV, BV)] = b_h2.astype(h_ref.dtype)
-    # if K > 128:
-    #   h_ref[0, boh + idx_t, idx_h, 128:192, pl.ds(idx_v * BV, BV)] = b_h3.astype(h_ref.dtype)
-    # if K > 192:
-    #   h_ref[0, boh + idx_t, idx_h, 192:256, pl.ds(idx_v * BV, BV)] = b_h4.astype(h_ref.dtype)
+    if K > 64:
+      h_ref[0, boh + idx_t, idx_h, pl.ds(idx_v * BV, BV), 64:128] = b_h2.astype(h_ref.dtype).transpose(1, 0)
+    if K > 128:
+      h_ref[0, boh + idx_t, idx_h, pl.ds(idx_v * BV, BV), 128:192] = b_h3.astype(h_ref.dtype).transpose(1, 0)
+    if K > 192:
+      h_ref[0, boh + idx_t, idx_h, pl.ds(idx_v * BV, BV), 192:256] = b_h4.astype(h_ref.dtype).transpose(1, 0)
 
 
     # m_t = (idx_t * BT + jnp.arange(0, BT)) < real_T
     # m_t_2d = m_t.astype(jnp.int32)[:,None].astype(jnp.bool)
 
-    # b_w = w_ref[0, pl.ds(bos + idx_t * BT, BT), idx_h, 0:64]
-    w_tmp = w_ref[idx_h, 0, pl.ds(bos + idx_t * BT, BT), 0, :]
-    b_w = w_tmp[:, 0:64]
-    # b_w = jnp.where(m_t_2d, b_w, 0)
+    b_w = w_ref[idx_h, 0, pl.ds(bos + idx_t * BT, BT), 0, :][:, 0:64]
     b_v = jnp.dot(b_w.astype(jnp.float32), b_h1, precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
-    # if K > 64:
-    #   b_w2 = w_ref[0, pl.ds(bos + idx_t * BT, BT), idx_h, 64:128]
-    #   b_w2 = jnp.where(m_t[:, None], b_w2, 0)
-    #   b_v += jnp.dot(b_w2.astype(jnp.float32), b_h2, preferred_element_type=jnp.float32)
-    # if K > 128:
-    #   b_w3 = w_ref[0, pl.ds(bos + idx_t * BT, BT), idx_h, 128:192]
-    #   b_w3 = jnp.where(m_t[:, None], b_w3, 0)
-    #   b_v += jnp.dot(b_w3.astype(jnp.float32), b_h3, preferred_element_type=jnp.float32)
-    # if K > 192:
-    #   b_w4 = w_ref[0, pl.ds(bos + idx_t * BT, BT), idx_h, 192:256]
-    #   b_w4 = jnp.where(m_t[:, None], b_w4, 0)
-    #   b_v += jnp.dot(b_w4.astype(jnp.float32), b_h4, preferred_element_type=jnp.float32)
+    if K > 64:
+      b_w = w_ref[idx_h, 0, pl.ds(bos + idx_t * BT, BT), 0, :][:, 64:128]
+      b_v = jnp.dot(b_w.astype(jnp.float32), b_h2, precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
+    if K > 128:
+      b_w = w_ref[idx_h, 0, pl.ds(bos + idx_t * BT, BT), 0, :][:, 128:192]
+      b_v = jnp.dot(b_w.astype(jnp.float32), b_h3, precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
+    if K > 192:
+      b_w = w_ref[idx_h, 0, pl.ds(bos + idx_t * BT, BT), 0, :][:, 192:256]
+      b_v = jnp.dot(b_w.astype(jnp.float32), b_h4, precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
 
     b_v_raw = v_ref[idx_h, 0, pl.ds(bos + idx_t * BT, BT), idx_v, 0:BV].astype(b_v.dtype)
-    # b_v_raw = b_v_raw.reshape(BT, 256)[:, 0:BV]
-    # print("b_v_raw.shape = ", b_v_raw.shape)
-    # b_v_raw = jnp.where(m_t_2d, b_v_raw, 0)
     b_v = b_v_raw - b_v
 
     if SAVE_NEW_VALUE:
-      # v_new_ref[idx_h, 0, pl.ds(bos + idx_t * BT, BT), idx_v, :, :] = pad_to_multiple(b_v, 512, -1, 0).reshape(BT, 2, 256).astype(v_new_ref.dtype)
       v_new_ref[idx_h, 0, pl.ds(bos + idx_t * BT, BT), idx_v, 0:BV] = b_v.astype(v_new_ref.dtype)
 
     last_idx = jnp.minimum((idx_t + 1) * BT, real_T) - 1
 
-    # if USE_G:
-    #   m_t = (idx_t * BT + jnp.arange(0, BT)) < real_T
-    #   b_g_last = g_ref[0, bos + last_idx, idx_h].astype(jnp.float32)
-    #   # g_trans = jnp.transpose(g_ref[...], [0, 2, 1])  # B, T, H -> B, H, T
-    #   # b_g = g_trans[0, idx_h, pl.ds(idx_t * BT, BT)]
-    #   b_g = g_ref[0, pl.ds(bos + idx_t * BT, BT), idx_h]
-    #   if USE_EXP2:
-    #     b_v = b_v * jnp.where(m_t, jnp.exp2(b_g_last - b_g), 0)[:, None]
-    #     b_g_last = jnp.exp2(b_g_last)
-    #   else:
-    #     b_v = b_v * jnp.where(m_t, jnp.exp(b_g_last - b_g), 0)[:, None]
-    #     b_g_last = jnp.exp(b_g_last)
-    #   b_h1 *= b_g_last
-    #   if K > 64:
-    #     b_h2 *= b_g_last
-    #   if K > 128:
-    #     b_h3 *= b_g_last
-    #   if K > 192:
-    #     b_h4 *= b_g_last
+    if USE_G:
+      m_t = (idx_t * BT + jnp.arange(0, BT)) < real_T
+      b_g_last = g_ref[0, bos + last_idx, idx_h, 0]
+      b_g = g_ref[0, pl.ds(bos + idx_t * BT, BT), idx_h, :]
+      b_g = b_g[:BT, :1].reshape(BT)
+      if USE_EXP2:
+        b_v = b_v * jnp.where(m_t, jnp.exp2(b_g_last - b_g), 0)[:, None]
+        b_g_last = jnp.exp2(b_g_last)
+      else:
+        b_v = b_v * jnp.where(m_t, jnp.exp(b_g_last - b_g), 0)[:, None]
+        b_g_last = jnp.exp(b_g_last)
+      b_h1 *= b_g_last
+      if K > 64:
+        b_h2 *= b_g_last
+      if K > 128:
+        b_h3 *= b_g_last
+      if K > 192:
+        b_h4 *= b_g_last
 
-    # if USE_GK:
-    #   o_k1 = jnp.arange(0, 64)
-    #   b_gk_last1 = jnp.where(o_k1 < K,
-    #                   gk_ref[0, bos + last_idx, idx_h, 0:64],
-    #                   0
-    #                 ).astype(jnp.float32)
-    #   if USE_EXP2:
-    #     b_h1 *= jnp.exp2(b_gk_last1)[:, None]
-    #   else:
-    #     b_h1 *= jnp.exp(b_gk_last1)[:, None]
+    if USE_GK:
+      o_k1 = jnp.arange(0, 64)
+      b_gk_last1 = jnp.where(o_k1 < K,
+                      gk_ref[0, bos + last_idx, idx_h, 0:64],
+                      0
+                    ).astype(jnp.float32)
+      if USE_EXP2:
+        b_h1 *= jnp.exp2(b_gk_last1)[:, None]
+      else:
+        b_h1 *= jnp.exp(b_gk_last1)[:, None]
 
-    #   if K > 64:
-    #     o_k2 = 64 + o_k1
-    #     b_gk_last2 = jnp.where(o_k2 < K, gk_ref[0, bos + last_idx, idx_h, 64:128], 0).astype(jnp.float32)
-    #     if USE_EXP2:
-    #       b_h2 *= jnp.exp2(b_gk_last2)[:, None]
-    #     else:
-    #       b_h2 *= jnp.exp(b_gk_last2)[:, None]
+      if K > 64:
+        o_k2 = 64 + o_k1
+        b_gk_last2 = jnp.where(o_k2 < K, gk_ref[0, bos + last_idx, idx_h, 64:128], 0).astype(jnp.float32)
+        if USE_EXP2:
+          b_h2 *= jnp.exp2(b_gk_last2)[:, None]
+        else:
+          b_h2 *= jnp.exp(b_gk_last2)[:, None]
 
-    #   if K > 128:
-    #     o_k3 = 128 + o_k1
-    #     b_gk_last3 = jnp.where(o_k3 < K, gk_ref[0, bos + last_idx, idx_h, 128:192], 0).astype(jnp.float32)
-    #     if USE_EXP2:
-    #       b_h3 *= jnp.exp2(b_gk_last3)[:, None]
-    #     else:
-    #       b_h3 *= jnp.exp(b_gk_last3)[:, None]
+      if K > 128:
+        o_k3 = 128 + o_k1
+        b_gk_last3 = jnp.where(o_k3 < K, gk_ref[0, bos + last_idx, idx_h, 128:192], 0).astype(jnp.float32)
+        if USE_EXP2:
+          b_h3 *= jnp.exp2(b_gk_last3)[:, None]
+        else:
+          b_h3 *= jnp.exp(b_gk_last3)[:, None]
 
-    #   if K > 192:
-    #     o_k4 = 192 + o_k1
-    #     b_gk_last4 = jnp.where(o_k4 < K, gk_ref[0, bos + last_idx, idx_h, 192:256], 0).astype(jnp.float32)
-    #     if USE_EXP2:
-    #       b_h4 *= jnp.exp2(b_gk_last4)[:, None]
-    #     else:
-    #       b_h4 *= jnp.exp(b_gk_last4)[:, None]
+      if K > 192:
+        o_k4 = 192 + o_k1
+        b_gk_last4 = jnp.where(o_k4 < K, gk_ref[0, bos + last_idx, idx_h, 192:256], 0).astype(jnp.float32)
+        if USE_EXP2:
+          b_h4 *= jnp.exp2(b_gk_last4)[:, None]
+        else:
+          b_h4 *= jnp.exp(b_gk_last4)[:, None]
 
     # b_v = b_v.astype(k_ref.dtype)
 
-    b_k = k_ref[idx_h, 0, pl.ds(bos + idx_t * BT, BT), 0, :]
-    b_k = b_k[:, 0:64]
-    # b_k = jnp.where(m_t_2d, b_k, 0).reshape(BT, 64).transpose(1, 0)
+    b_k = k_ref[idx_h, 0, pl.ds(bos + idx_t * BT, BT), 0, :][:, 0:64]
     b_h1 += jnp.dot(b_k.astype(jnp.float32).T, b_v.astype(jnp.float32), precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
-    # if K > 64:
-    #   b_k2 = k_ref[0, pl.ds(bos + idx_t * BT, BT), idx_h, 64:128]
-    #   b_k2 = jnp.where(m_t[:, None], b_k2, 0).reshape(BT, 64).transpose(1, 0)
-    #   b_h2 += jnp.dot(b_k2.astype(jnp.float32), b_v.astype(jnp.float32), precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
-    # if K > 128:
-    #   b_k3 = k_ref[0, pl.ds(bos + idx_t * BT, BT), idx_h, 128:192]
-    #   b_k3 = jnp.where(m_t[:, None], b_k3, 0).reshape(BT, 64).transpose(1, 0)
-    #   b_h3 += jnp.dot(b_k3.astype(jnp.float32), b_v.astype(jnp.float32), precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
-    # if K > 192:
-    #   b_k4 = k_ref[0, pl.ds(bos + idx_t * BT, BT), idx_h, 192:256]
-    #   b_k4 = jnp.where(m_t[:, None], b_k4, 0).reshape(BT, 64).transpose(1, 0)
-    #   b_h4 += jnp.dot(b_k4.astype(jnp.float32), b_v.astype(jnp.float32), precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
+    if K > 64:
+      b_k = k_ref[idx_h, 0, pl.ds(bos + idx_t * BT, BT), 0, :][:, 64:128]
+      b_h2 += jnp.dot(b_k.astype(jnp.float32).T, b_v.astype(jnp.float32), precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
+
+    if K > 128:
+      b_k = k_ref[idx_h, 0, pl.ds(bos + idx_t * BT, BT), 0, :][:, 128:192]
+      b_h3 += jnp.dot(b_k.astype(jnp.float32).T, b_v.astype(jnp.float32), precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
+    if K > 192:
+      b_k = k_ref[idx_h, 0, pl.ds(bos + idx_t * BT, BT), 0, :][:, 192:256]
+      b_h4 += jnp.dot(b_k.astype(jnp.float32).T, b_v.astype(jnp.float32), precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
 
     return b_h1, b_h2, b_h3, b_h4
 
@@ -346,6 +325,8 @@ def chunk_gated_delta_rule_fwd_h_varlen(
 
   if g is not None:
     g_fp32 = g.astype(jnp.float32)
+    g_fp32 = g_fp32.reshape(B, T, H, 1)
+    g_fp32 = pad_to_multiple(g_fp32, 128, -1, 0)
   else:
     g_fp32 = None
 
@@ -361,7 +342,7 @@ def chunk_gated_delta_rule_fwd_h_varlen(
   k_blockspec = pl.BlockSpec([H, B, T, K_PADSIZE//128, 128], index_map = lambda v, bh: (0, 0, 0, 0, 0))
   w_blockspec = pl.BlockSpec([H, B, T, K_PADSIZE//128, 128], index_map = lambda v, bh: (0, 0, 0, 0, 0))
   v_blockspec = pl.BlockSpec([H, B, T, v_paded.shape[3], BV], index_map = lambda v, bh: (0, 0, 0, 0, 0))
-  g_blockspec = pl.BlockSpec([B, T, H], index_map = lambda v, bh: (0, 0, 0))
+  g_blockspec = pl.BlockSpec([B, T, H, 128], index_map = lambda v, bh: (0, 0, 0, 0))
   gk_blockspec = pl.BlockSpec([B, T, H, K], index_map = lambda v, bh: (0, 0, 0, 0))
   init_blockspec = pl.BlockSpec([N, H, V, K], index_map = lambda v, bh: (0, 0, 0, 0))
   seqlens_blockspec = pl.BlockSpec([N + 1], index_map = lambda v, bh: (0,), memory_space = pltpu.MemorySpace.SMEM)
