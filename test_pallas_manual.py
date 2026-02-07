@@ -67,18 +67,17 @@ def chunk_gated_delta_rule_fwd(
       h_ref[0, i_t, 0, 192:256, 0:BV] = b_h4.astype(h_ref.dtype)  # type: ignore
 
     b_w = w_ref[0, 0, i_t * BT: i_t * BT + BT, 0:64]
-    b_v = jnp.dot(b_w, b_h1.astype(b_w.dtype), preferred_element_type=jnp.float32)
-    # b_v = jnp.dot(b_w.astype(jnp.float32), b_h1, precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
+    b_v = jnp.dot(b_w.astype(jnp.float32), b_h1, precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
 
     if (K > 64):
       b_w = w_ref[0, 0, i_t * BT: i_t * BT + BT, 64:128]
-      b_v += jnp.dot(b_w, b_h2.astype(b_w.dtype), preferred_element_type=jnp.float32)
+      b_v += jnp.dot(b_w.astype(jnp.float32), b_h2, precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
     if (K > 128):
       b_w = w_ref[0, 0, i_t * BT: i_t * BT + BT, 128:192]
-      b_v += jnp.dot(b_w, b_h3.astype(b_w.dtype), preferred_element_type=jnp.float32)
+      b_v += jnp.dot(b_w.astype(jnp.float32), b_h3, precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
     if (K > 192):
       b_w = w_ref[0, 0, i_t * BT: i_t * BT + BT, 192:256]
-      b_v += jnp.dot(b_w, b_h4.astype(b_w.dtype), preferred_element_type=jnp.float32)
+      b_v += jnp.dot(b_w.astype(jnp.float32), b_h4, precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
     b_v = v_ref[0, 0, i_t * BT: i_t * BT + BT, 0:BV].astype(b_v.dtype) - b_v
 
     if (SAVE_NEW_VALUE):
@@ -273,20 +272,18 @@ def chunk_gla_fwd_o_gk_kernel(q_ref, v_ref, g_ref, h_ref, a_ref,
     h = h_ref[...].reshape(K, BV)[idx_k * BK: (idx_k + 1) * BK, :]
     # 这里是决定精度的重点
     if USE_EXP2:
-      qg = (q.astype(jnp.float32) * jnp.exp2(g.astype(jnp.float32))).astype(q.dtype)
+      qg = (q.astype(jnp.float32) * jnp.exp2(g.astype(jnp.float32)))
     else:
-      qg = (q.astype(jnp.float32) * jnp.exp(g.astype(jnp.float32))).astype(q.dtype)
+      qg = (q.astype(jnp.float32) * jnp.exp(g.astype(jnp.float32)))
 
     if idx_k >= 0:
-      b_o += jnp.dot(qg, h.astype(qg.dtype), preferred_element_type=jnp.float32)
-      # b_o += jnp.dot(qg.astype(jnp.float32), h.astype(jnp.float32), precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
+      b_o += jnp.dot(qg.astype(jnp.float32), h.astype(jnp.float32), precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
 
   b_o *= scale
   v = v_ref[...].reshape(BT, BV)
   a = a_ref[...].reshape(BT, BT)
   a = jnp.where(m_s, a, 0).astype(v.dtype)
-  b_o += jnp.dot(a, v, preferred_element_type=jnp.float32)
-  # b_o += jnp.dot(a.astype(jnp.float32), v.astype(jnp.float32), precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
+  b_o += jnp.dot(a.astype(jnp.float32), v.astype(jnp.float32), precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
   o_ref[...] = b_o.reshape(1, 1, BT, BV).astype(o_ref.dtype)
 
 

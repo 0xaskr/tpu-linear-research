@@ -39,16 +39,24 @@ def prepare_chunk_indices(
 ) -> torch.Tensor:
     """
     Generate chunk indices for variable length sequences.
-    为变长序列生成分块索引。
+
+    Example:
+        >>> cu_seqlens = torch.tensor([0, 2, 5])
+        >>> chunk_size = 2
+        >>> prepare_chunk_indices(cu_seqlens, chunk_size)
+        tensor([[0, 0],
+                [1, 0],
+                [1, 1]])
+        Explanation:
+        - Sequence 0 (len 2): 1 chunk (chunk 0)
+        - Sequence 1 (len 3): 2 chunks (chunk 0, chunk 1)
 
     Returns:
         torch.LongTensor: A tensor of shape [Num_Total_Chunks, 2].
         Each row is (sequence_id, chunk_id).
-        每一行包含两个标记：(句子ID, 该句内的块ID)。
     """
     if cu_seqlens_cpu is not None:
         # Calculate number of chunks for each sequence: ceil(seq_len / chunk_size)
-        # 计算每个句子被分成了多少个块
         indices = torch.cat([torch.arange(n, device=cu_seqlens.device)
                             for n in cdiv_pt(torch.diff(cu_seqlens_cpu), chunk_size).tolist()])
         # Stack sequence_id and chunk_id
@@ -56,15 +64,7 @@ def prepare_chunk_indices(
         # cumsum counts these resets to get sequence_id
         return torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1).to(cu_seqlens)
 
-    # prepare_lens = torch.diff
     indices = torch.cat([torch.arange(n) for n in cdiv_pt(torch.diff(cu_seqlens), chunk_size).tolist()])
-    # 这个函数只生成逻辑上的 (Seq_ID, Chunk_ID) 对，不涉及实际数据的读取。
-    # 越界保护机制 (Boundary Check):
-    # 下游的 Triton Kernel 在使用这些 ID 时，必须执行以下逻辑：
-    # 1. 计算当前 Chunk 的起始 Token： start_token_idx = cu_seqlens[seq_id] + chunk_id * chunk_size
-    # 2. 计算当前 Chunk 的有效长度： visible_len = min(chunk_size, seq_len - chunk_id * chunk_size)
-    # 3. 使用 Mask 加载数据： tl.load(..., mask=offsets < visible_len, other=0)
-    # 因此，即使最后一个 Chunk 不满 (Partial Chunk)，Kernel 也会通过 Mask 防止越界。
     return torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1).to(cu_seqlens)
 
 def chunk_gated_delta_rule_fwd_kernel_varlen(
@@ -422,63 +422,208 @@ def chunk_gated_delta_rule_fwd_h_varlen(
   h = h.transpose(0, 1, 2, 4, 3)
   return h, (v_out if save_new_value else None), (final_out if output_final_state else None)
 
-def test_varlen():
-    print("\nStarting Varlen Unit Test...")
+def chunk_gla_fwd_o_gk_kernel_varlen(
+    q_ref, v_ref, g_ref, h_ref, A_ref, chunk_indices_ref, cu_seqlens_ref, # Inputs
+    o_ref,                                                                # Output
+    scale,
+    TotalT, TotalChunks, H, K, V, BT, BV,
+    USE_EXP2
+):
+    idx_v, idx_chunk_h = pl.program_id(0), pl.program_id(1)
+    idx_chunk = idx_chunk_h // H
 
-    seqlens_list = [64, 128] # Simple lengths
-    TotalT = sum(seqlens_list)
-    B, H, K, V = 1, 4, 64, 64
-    chunk_size = 64
-    N = len(seqlens_list)
+    seq_id = chunk_indices_ref[idx_chunk, 0]
+    local_chunk_id = chunk_indices_ref[idx_chunk, 1]
 
-    rng_dtype = torch.bfloat16
-    triton_dtype = torch.float32
-    pallas_dtype = jnp.bfloat16
+    bos = cu_seqlens_ref[seq_id]
+    eos = cu_seqlens_ref[seq_id + 1]
 
-    torch.manual_seed(42)
-    k = torch.randn((B, TotalT, H, K), dtype=rng_dtype)
-    w = torch.randn((B, TotalT, H, K), dtype=rng_dtype)
-    u = torch.randn((B, TotalT, H, V), dtype=rng_dtype)
-    g = torch.randn((B, TotalT, H), dtype=rng_dtype)
-    gk = torch.randn((B, TotalT, H, K), dtype=rng_dtype)
-    h0 = torch.randn((N, H, K, V), dtype=rng_dtype)
+    chunk_start = bos + local_chunk_id * BT
+    valid_len = jnp.minimum(BT, eos - chunk_start)
+    mask_t = jnp.arange(BT)[:, None] < valid_len
 
-    cu_seqlens = torch.tensor(np.cumsum([0] + seqlens_list), dtype=torch.int32)
-    chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
+    # q_ref is [1, 1, 1, BT, 128]
+    b_q = q_ref[0, 0, 0, :, :]
+    b_g = g_ref[0, 0, 0, :, :]
 
-    # print("Running Triton Reference...")
-    # h_ref, v_new_ref, final_state_ref = triton_fwd(
-    #     k=k.float(), w=w.float(), u=u.float(), g=g.float(), gk=gk.float(),
-    #     initial_state=h0.float(), output_final_state=True,
-    #     chunk_size=chunk_size, save_new_value=True,
-    #     cu_seqlens=cu_seqlens, use_exp2=False
-    # )
+    # A_ref is [1, 1, 1, BT, 128] -> Slice to [BT, BT]
+    b_A_full = A_ref[0, 0, 0, :, :]
+    b_A = b_A_full[:, :BT]
 
-    # 2. Pallas Implementation
-    print("Running Pallas Implementation...")
-    k_jax = jnp.array(k.to(torch.float32), dtype=pallas_dtype)
-    w_jax = jnp.array(w.to(torch.float32), dtype=pallas_dtype)
-    u_jax = jnp.array(u.to(torch.float32), dtype=pallas_dtype)
-    g_jax = jnp.array(g.to(torch.float32), dtype=pallas_dtype)
-    gk_jax = jnp.array(gk.to(torch.float32), dtype=pallas_dtype)
-    h0_jax = jnp.array(h0.to(torch.float32), dtype=pallas_dtype)
-    seqlens_jax = jnp.array(cu_seqlens.numpy(), dtype=jnp.int32)
-    chunk_indices_jax = jnp.array(chunk_indices.numpy(), dtype=jnp.int32)
+    # v_ref is [1, 1, 1, BT, 128]
+    # BV=128
+    b_v = v_ref[0, 0, 0, :, pl.ds(idx_v*BV, BV)]
 
-    h_history_jax, v_new_jax, final_state_jax = chunk_gated_delta_rule_fwd_h_varlen(
-        k=k_jax, w=w_jax, u=u_jax, g=g_jax, gk=gk_jax,
-        initial_state=h0_jax, output_final_state=True,
-        chunk_size=chunk_size, save_new_value=True,
-        seqlens=seqlens_jax, chunk_indices=chunk_indices_jax,
-        use_exp2=False
-    )
-    jax.block_until_ready(final_state_jax)
+    # h_ref: [1, 1, 128, 128] (Sliced H)
+    b_h = h_ref[0, 0, :, pl.ds(idx_v*BV, BV)]
 
-    # 3. Compare
-    # compare_tensor("Final State", final_state_ref, final_state_jax)
-    # compare_tensor("Residual (v_new)", v_new_ref.squeeze(0), v_new_jax)
-    # compare_tensor("Hidden History", h_ref.squeeze(0), h_history_jax)
+    # Masking
+    mask_broad = mask_t[None, ...]
 
-if __name__ == "__main__":
-  test_varlen()
+    # Apply mask to q, g
+    b_q = jnp.where(mask_t, b_q, 0)
+    # b_g = jnp.where(mask_t, b_g, 0)
 
+    if USE_EXP2:
+        b_qg = b_q.astype(jnp.float32) * jnp.exp2(b_g.astype(jnp.float32))
+    else:
+        b_qg = b_q.astype(jnp.float32) * jnp.exp(b_g.astype(jnp.float32))
+
+    # Inter-chunk: (q * exp(g)) @ h
+    # [BT, 128] @ [128, BV] -> [BT, BV]
+    b_inter = jnp.matmul(b_qg, b_h.astype(jnp.float32), precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
+    b_inter *= scale
+
+    # Intra-chunk: A @ v
+    # Mask A
+    mask_causal = jnp.arange(BT)[:, None] >= jnp.arange(BT)[None, :]
+    mask_intra = mask_t & mask_causal # [BT, BT]
+
+    b_A = jnp.where(mask_intra, b_A, 0)
+    b_v = jnp.where(mask_t, b_v, 0)
+
+    # [BT, BT] @ [BT, BV] -> [BT, BV]
+    b_intra = jnp.matmul(b_A.astype(jnp.float32), b_v.astype(jnp.float32), precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32)
+
+    b_o = b_inter + b_intra # [BT, BV]
+
+    # Store
+    # o_ref: [1, 1, 1, BT, 128]
+    o_ref[0, 0, 0, :, pl.ds(idx_v*BV, BV)] = b_o.astype(o_ref.dtype)
+
+def chunk_gla_fwd_o_gk_varlen(
+    q: jax.Array,
+    v: jax.Array,
+    g: jax.Array,
+    A: jax.Array,
+    h: jax.Array,
+    chunk_indices: jax.Array,
+    seqlens: jax.Array,
+    scale: float,
+    chunk_size: int = 64,
+    use_exp2: bool = False,
+):
+    TotalT, H, K = q.shape
+    V = v.shape[-1]
+    BT = chunk_size
+    TotalChunks = chunk_indices.shape[0]
+
+    assert q.shape == (TotalT, H, K)
+    assert v.shape == (TotalT, H, V)
+    assert g.shape == (TotalT, H, K)
+    assert A.shape == (TotalT, H, BT)
+    # h: [TotalChunks, H, K, V]
+
+    # Save original shapes for slicing back
+    V_orig = V
+
+    # Reshape to [1, TotalT, H, K] for Pallas consistency
+    q = q[None, ...]
+    v = v[None, ...]
+    g = g[None, ...]
+    A = A[None, ...]
+
+    # Pad TotalT to multiple of BT (chunk_size)
+    q = pad_to_multiple(q, BT, 1, 0)
+    v = pad_to_multiple(v, BT, 1, 0)
+    g = pad_to_multiple(g, BT, 1, 0)
+    A = pad_to_multiple(A, BT, 1, 0)
+
+    PaddedT = q.shape[1]
+
+    # Pad K, V, A_last to 128
+    q = pad_to_multiple(q, 128, 3, 0)
+    g = pad_to_multiple(g, 128, 3, 0)
+    v = pad_to_multiple(v, 128, 3, 0)
+    A = pad_to_multiple(A, 128, 3, 0) # Pad BT dim to 128
+
+    # Pad h
+    # h: [TotalChunks, H, K, V]
+    h = pad_to_multiple(h, 128, 2, 0) # Pad K
+    h = pad_to_multiple(h, 128, 3, 0) # Pad V
+
+    # Transpose inputs to [H, 1, T, K] to satisfy Pallas/Mosaic constraints
+    # (Second to last dim must be divisible by 8)
+    q = q.transpose(2, 0, 1, 3) # [H, 1, T, K]
+    v = v.transpose(2, 0, 1, 3)
+    g = g.transpose(2, 0, 1, 3)
+    A = A.transpose(2, 0, 1, 3)
+
+    K_padded = q.shape[3]
+    V_padded = v.shape[3]
+    BV = 128 # Block size for V (Must be 128 for alignment)
+
+    # Reshape T -> [TotalChunks, BT]
+    # This assumes PaddedT == TotalChunks * BT, which is true if seqlens are padded/aligned.
+    assert PaddedT % BT == 0
+    NumChunks = PaddedT // BT
+
+    # [H, 1, NumChunks, BT, 128]
+    q = q.reshape(H, 1, NumChunks, BT, 128)
+    v = v.reshape(H, 1, NumChunks, BT, 128)
+    g = g.reshape(H, 1, NumChunks, BT, 128)
+    A = A.reshape(H, 1, NumChunks, BT, 128)
+
+    o_shape = v.shape # [H, 1, NumChunks, BT, 128]
+    o = jnp.zeros(o_shape, dtype=v.dtype)
+
+    o_spec = jax.ShapeDtypeStruct(o_shape, o.dtype)
+
+    # BlockSpecs
+    # Slice H (dim 0) and Chunk (dim 2)
+    # Index Map: (ch % H, 0, ch // H, 0, 0)
+    # Kernel sees: [1, 1, 1, 64, 128]
+
+    slice_shape_q = (1, 1, 1, BT, K_padded)
+    slice_shape_v = (1, 1, 1, BT, V_padded)
+    slice_shape_g = (1, 1, 1, BT, K_padded)
+    slice_shape_A = (1, 1, 1, BT, 128)
+
+    q_blockspec = pl.BlockSpec(slice_shape_q, index_map=lambda v, ch: (ch % H, 0, ch // H, 0, 0))
+    v_blockspec = pl.BlockSpec(slice_shape_v, index_map=lambda v, ch: (ch % H, 0, ch // H, 0, 0))
+    g_blockspec = pl.BlockSpec(slice_shape_g, index_map=lambda v, ch: (ch % H, 0, ch // H, 0, 0))
+    A_blockspec = pl.BlockSpec(slice_shape_A, index_map=lambda v, ch: (ch % H, 0, ch // H, 0, 0))
+
+    # h: [TotalChunks, H, K, V]
+    # Slice H (dim 1) and Chunk (dim 0)
+    # Index Map: (ch // H, ch % H, 0, 0)
+    # Kernel sees: [1, 1, 128, 128]
+    # h_shape: [TotalChunks, H, 128, 128]
+    slice_shape_h = (1, 1, 128, 128)
+    h_blockspec = pl.BlockSpec(slice_shape_h, index_map=lambda v, ch: (ch // H, ch % H, 0, 0))
+
+    ci_blockspec = pl.BlockSpec([TotalChunks, 2], index_map=lambda v, ch: (0, 0), memory_space=pltpu.MemorySpace.SMEM)
+    sl_blockspec = pl.BlockSpec([seqlens.shape[0]], index_map=lambda v, ch: (0,), memory_space=pltpu.MemorySpace.SMEM)
+
+    o_blockspec = pl.BlockSpec(slice_shape_v, index_map=lambda v, ch: (ch % H, 0, ch // H, 0, 0))
+
+    # Grid: (V_blocks, TotalChunks * H)
+    grid = (int(V_padded // BV), TotalChunks * H)
+
+    o = pl.pallas_call(
+        functools.partial(
+            chunk_gla_fwd_o_gk_kernel_varlen,
+            scale=scale,
+            TotalT=PaddedT,
+            TotalChunks=TotalChunks,
+            H=H, K=K_padded, V=V_padded, BT=BT, BV=BV,
+            USE_EXP2=use_exp2
+        ),
+        grid=grid,
+        in_specs=[q_blockspec, v_blockspec, g_blockspec, h_blockspec, A_blockspec, ci_blockspec, sl_blockspec],
+        out_shape=o_spec,
+        out_specs=o_blockspec
+    )(q, v, g, h, A, chunk_indices, seqlens)
+
+    # o is [H, 1, NumChunks, BT, 128]
+    # Reshape to [H, 1, PaddedT, 128]
+    o = o.reshape(H, 1, PaddedT, 128)
+
+    # Transpose back to [1, T, H, 128]
+    o = o.transpose(1, 2, 0, 3)
+
+    # Remove B=1 and slice
+    o = o[0] # [T, H, 128]
+    o = o[:TotalT, :, :V_orig]
+
+    return o

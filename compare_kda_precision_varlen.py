@@ -19,19 +19,23 @@ if os.path.exists(os.path.join(os.getcwd(), 'fla')):
 # Attempt imports
 try:
     from test_pallas_manual_varlen import chunk_gated_delta_rule_fwd_h_varlen as pallas_fwd
+    from test_pallas_manual_varlen import chunk_gla_fwd_o_gk_varlen as pallas_o_gk_fwd
     from test_pallas_manual_varlen import prepare_chunk_indices
     print("Successfully imported Pallas kernel wrapper.")
 except ImportError as e:
     print(f"Failed to import Pallas kernel wrapper: {e}")
     pallas_fwd = None
+    pallas_o_gk_fwd = None
     prepare_chunk_indices = None
 
 try:
     from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_h as triton_fwd
+    from fla.ops.gla.chunk import chunk_gla_fwd_o_gk as triton_o_gk_fwd
     HAS_TRITON = True
 except ImportError:
     HAS_TRITON = False
     triton_fwd = None
+    triton_o_gk_fwd = None
     print("Triton kernel not found.")
 
 def compare_tensor(name, pt_t, jax_t, atol=1e-5, rtol=1e-5):
@@ -57,6 +61,7 @@ def compare_tensor(name, pt_t, jax_t, atol=1e-5, rtol=1e-5):
     diff = np.abs(pt_val - jax_val)
     max_diff = np.max(diff)
     max_val = np.max(np.abs(jax_val))
+    max_rel_diff = np.max(diff / (np.abs(jax_val) + 1e-12))
 
     is_close = np.allclose(pt_val, jax_val, atol=atol, rtol=rtol)
     status = "PASS" if is_close else "FAIL"
@@ -64,6 +69,7 @@ def compare_tensor(name, pt_t, jax_t, atol=1e-5, rtol=1e-5):
     print(f"[{name}] {status}")
     print(f"  Max Value        : {max_val:.6e}")
     print(f"  Max Abs Diff     : {max_diff:.6e}")
+    print(f"  Max Rel Diff     : {max_rel_diff:.6e}")
 
     if not is_close:
         tolerance = atol + rtol * np.abs(jax_val)
@@ -106,7 +112,7 @@ def generate_inputs(B, H, K, V, seqlens_list, chunk_size, dtype=torch.bfloat16):
 
 def run_correctness(args):
     print("\n" + "="*40)
-    print("Running Varlen Comparison FP32 (Correctness)")
+    print("Running Varlen Comparison FP32 (chunk_gated_delta_rule_fwd_h)")
     print("="*40)
 
     # Configuration
@@ -116,7 +122,7 @@ def run_correctness(args):
 
     # seqlens_list = [64, 128, 64]
     # Using the case that failed previously to ensure fix
-    seqlens_list = [32]
+    seqlens_list = [32, 128, 137]
     N = len(seqlens_list)
     TotalT = sum(seqlens_list)
     chunk_size = 64
@@ -190,6 +196,91 @@ def run_correctness(args):
         compare_tensor("Final State (ht)", final_state_ref, final_state_jax, atol=atol, rtol=rtol)
     else:
         print("Skipping comparison because one or both backends failed to run.")
+
+def run_comparison_o_gk_varlen(args):
+    print("\n" + "="*40)
+    print("Running Varlen Comparison o_gk (chunk_gla_fwd_o_gk)")
+    print("="*40)
+
+    if pallas_o_gk_fwd is None:
+        print("Pallas o_gk kernel not found.")
+        return
+    if triton_o_gk_fwd is None:
+        print("Triton o_gk kernel not found.")
+        return
+
+    # Configuration
+    rng_dtype = torch.bfloat16
+    triton_dtype = torch.float32
+    jax_dtype = jnp.float32
+
+    seqlens_list = [64, 128, 128]
+    N = len(seqlens_list)
+    TotalT = sum(seqlens_list)
+    chunk_size = 64
+    B, H, K, V = 1, 4, 64, 64
+    scale = K ** -0.5
+
+    print(f"N={N}, Seqlens={seqlens_list}, TotalT={TotalT}, H={H}, K={K}, V={V}, chunk_size={chunk_size}")
+
+    torch.manual_seed(42)
+    # Inputs: q, v, g, A, h
+    q = torch.randn((B, TotalT, H, K), dtype=rng_dtype)
+    v = torch.randn((B, TotalT, H, V), dtype=rng_dtype)
+    g = torch.randn((B, TotalT, H, K), dtype=rng_dtype)
+    A = torch.randn((B, TotalT, H, chunk_size), dtype=rng_dtype)
+
+    # Generate chunk indices/offsets
+    cu_seqlens = torch.tensor([0] + list(np.cumsum(seqlens_list)), dtype=torch.int32)
+    chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
+    TotalChunks = chunk_indices.shape[0]
+
+    h = torch.randn((B, TotalChunks, H, K, V), dtype=rng_dtype)
+
+    # Triton Run
+    print("Running Triton o_gk varlen...")
+    q_pt = q.to(device="cpu", dtype=triton_dtype)
+    v_pt = v.to(device="cpu", dtype=triton_dtype)
+    g_pt = g.to(device="cpu", dtype=triton_dtype)
+    A_pt = A.to(device="cpu", dtype=triton_dtype)
+    h_pt = h.to(device="cpu", dtype=triton_dtype)
+    cu_seqlens_pt = cu_seqlens.to(device="cpu", dtype=torch.int32)
+
+    # Triton chunk_gla_fwd_o_gk signature:
+    # q, v, g, A, h, scale, cu_seqlens, chunk_size, chunk_indices, use_exp2
+    o_ref = triton_o_gk_fwd(
+        q=q_pt, v=v_pt, g=g_pt, A=A_pt, h=h_pt,
+        scale=scale,
+        cu_seqlens=cu_seqlens_pt,
+        chunk_size=chunk_size,
+        use_exp2=False
+    )
+
+    # Pallas Run
+    print("Running Pallas o_gk varlen...")
+    # Pallas inputs: [TotalT, H, K] (squeezed B=1)
+    q_jax = jnp.array(q.squeeze(0).float().numpy(), dtype=jax_dtype)
+    v_jax = jnp.array(v.squeeze(0).float().numpy(), dtype=jax_dtype)
+    g_jax = jnp.array(g.squeeze(0).float().numpy(), dtype=jax_dtype)
+    A_jax = jnp.array(A.squeeze(0).float().numpy(), dtype=jax_dtype)
+    h_jax = jnp.array(h.squeeze(0).float().numpy(), dtype=jax_dtype)
+
+    chunk_indices_jax = jnp.array(chunk_indices.numpy(), dtype=jnp.int32)
+    seqlens_jax = jnp.array(cu_seqlens.numpy(), dtype=jnp.int32)
+
+    o_jax = pallas_o_gk_fwd(
+        q=q_jax, v=v_jax, g=g_jax, A=A_jax, h=h_jax,
+        chunk_indices=chunk_indices_jax,
+        seqlens=seqlens_jax,
+        scale=scale,
+        chunk_size=chunk_size,
+        use_exp2=False
+    )
+
+    # Compare
+    # o_ref: [B, TotalT, H, V] -> [TotalT, H, V]
+    o_ref_squeezed = o_ref.squeeze(0)
+    compare_tensor("Output (o)", o_ref_squeezed, o_jax, atol=1e-2, rtol=1e-2)
 
 def run_benchmark(args):
     if pallas_fwd is None:
@@ -277,7 +368,8 @@ def main():
     if args.bench:
         run_benchmark(args)
     else:
-        run_correctness(args)
+        # run_correctness(args)
+        run_comparison_o_gk_varlen(args)
 
 if __name__ == "__main__":
     main()
