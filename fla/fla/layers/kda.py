@@ -128,7 +128,7 @@ class KimiDeltaAttention(nn.Module):
                 f"expand_v={expand_v} does not produce an integer value when multiplied by key_dim={self.key_dim}. "
                 f"Resulting value_dim would be {self.num_v_heads * self.head_dim * expand_v}, which is invalid for nn.Linear.",
             )
-        
+
         # 检查头数的倍数关系
         if self.num_v_heads > self.num_heads and self.num_v_heads % self.num_heads != 0:
             raise ValueError(
@@ -238,7 +238,7 @@ class KimiDeltaAttention(nn.Module):
         #                  但逻辑上是的。现实中句子长短不一，短句子会补 0 (Padding) 到和长句子一样长。
         #                  这就是为什么我们需要 attention_mask 来标记“哪些是真 token，哪些是凑数的 0”。
         batch_size, q_len, _ = hidden_states.shape
-        
+
         # 智能模式切换：
         # 如果序列很短 (<=64) 且在推理模式 (not training)，强制使用 recurrent 以提高小 batch/短序列效率。
         # change to inference mode.
@@ -285,7 +285,7 @@ class KimiDeltaAttention(nn.Module):
             # 从 Cache 中恢复卷积状态 (注意：卷积状态 Conv State 不同于 RNN 的记忆状态 Recurrent State)
             if last_state is not None:
                 conv_state_q, conv_state_k, conv_state_v = last_state["conv_state"]
-            
+
             # 对 Q/K/V 分别进行： 线性投影 -> 卷积处理 -> 激活
             # Q (Query): 我们想要查询什么信息？
             q, conv_state_q = self.q_conv1d(
@@ -332,7 +332,7 @@ class KimiDeltaAttention(nn.Module):
         # 重塑张量形状：[..., total_head_dim] -> [..., num_heads, head_dim]
         q, k, g = (rearrange(x, "... (h d) -> ... h d", d=self.head_k_dim) for x in (q, k, g))
         v = rearrange(v, "... (h d) -> ... h d", d=self.head_v_dim)
-        
+
         # q/k/g: [batch_size, seq_len, num_heads, head_dim]
         # v: [batch_size, seq_len, num_v_heads, head_v_dim]
 
@@ -350,7 +350,7 @@ class KimiDeltaAttention(nn.Module):
 
         # 获取 RNN 循环状态
         recurrent_state = last_state["recurrent_state"] if last_state is not None else None
-        
+
         # === 步骤 3: 核心 KDA 计算 (Core Kernel: The Delta Rule) ===
         # 这里的核心逻辑是 Delta Rule (增量规则)： New_State = Old_State + Beta * (V - Old_State * K)
         # 即：只记录当前记忆预测产生的"误差" (Delta)，而不是简单累加信息。
@@ -402,7 +402,7 @@ class KimiDeltaAttention(nn.Module):
         # === 步骤 4: 输出归一化与投影 (Output Norm & Proj) ===
         # 这里的归一化也是带门控的 (Gated)，不仅把输出理顺 (Norm)，
         # 还根据输入再次决定放行多少信息 (Gate)。
-        
+
         # 计算输出门控信号 (来自第二个 g_proj)
         gate_output = rearrange(self.g_proj(hidden_states), "... (h d) -> ... h d", d=self.head_v_dim)
         # gate_output: [batch_size, seq_len, num_heads, head_v_dim]
@@ -410,13 +410,13 @@ class KimiDeltaAttention(nn.Module):
         # 融合了门控的 RMSNorm: Output = RMSNorm(O) * Sigmoid(Gate)
         o = self.o_norm(o, gate_output)
         # o (after norm): [batch_size, seq_len, num_heads, head_v_dim]
-        
+
         # 展平头维度：[batch, seq, num_heads, head_dim] -> [batch, seq, hidden_size]
         o = rearrange(o, "b t h d -> b t (h d)")
         # 最终输出投影
         o = self.o_proj(o)
         # o (final): [batch_size, seq_len, hidden_size]
-        
+
         # 如果之前移除了 padding，现在恢复 padding 结构
         if attention_mask is not None:
             o = pad_input(o.squeeze(0), indices, batch_size, q_len)

@@ -63,9 +63,9 @@ class DenseGeneral(nnx.Module):
   def __call__(self, inputs: Array) -> Array:
     inputs = jnp.asarray(inputs, self.dtype)
     norm_axis = normalize_axes(self.axis, inputs.ndim)
-    
+
     kernel = jnp.asarray(self.kernel.value, self.dtype)
-    
+
     contract_ind = tuple(range(0, len(self.axis)))
     output = jax.lax.dot_general(
         inputs, kernel, ((norm_axis, contract_ind), ((), ()))

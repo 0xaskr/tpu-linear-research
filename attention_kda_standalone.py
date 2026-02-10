@@ -390,7 +390,7 @@ def _recurrent_kda_sequence(
     return o, final_state
 
 
-def chunk_kda_reference(
+def _token_recurrent_kda(
     q: Array, k: Array, v: Array, g: Array, beta: Array,
     scale: float | None = None,
     initial_state: Array | None = None,
@@ -400,7 +400,7 @@ def chunk_kda_reference(
     cu_seqlens: Array | None = None,
     **kwargs: Any,
 ) -> tuple[Array, Array | None]:
-    """Reference chunk_kda using recurrent formulation."""
+    """Token-level recurrent KDA reference (supports both dense and varlen)."""
     if use_gate_in_kernel:
         raise ValueError("use_gate_in_kernel not supported in reference")
 
@@ -494,6 +494,443 @@ def chunk_kda_reference(
     return o.astype(v.dtype), final_state
 
 
+# ============================================================================
+# Chunked KDA: 3-stage decomposition (aligned with Triton ChunkKDAFunction)
+# ============================================================================
+#
+# The Triton forward pass decomposes chunk_kda into three stages:
+#
+#   Stage 0  – Gate cumsum + optional L2-norm  (preprocessing)
+#   Stage 1  – Intra-chunk: Aqk, Akk matrices, solve linear system  → w, u, kg
+#   Stage 2  – Inter-chunk: scan over chunks to propagate RNN state  → h, v_new
+#   Stage 3  – Output: combine inter-chunk state query + intra-chunk attention
+#
+# Key tensors:
+#   w       – effective keys   (I + strict_tril(Akk))^{-1} @ (k * beta * exp(G))
+#   u       – effective values  (I + strict_tril(Akk))^{-1} @ (v * beta)
+#   kg      – normalised keys   k * exp(G_last - G)
+#   Aqk     – causal attention   scale * <q·e^G, k·e^{-G}>  (lower-triangular)
+#   h       – per-chunk history  state *before* processing the chunk
+#   v_new   – delta residual     u - w @ h
+# ============================================================================
+
+def chunk_local_cumsum(
+    g: Array,
+    chunk_size: int,
+) -> Array:
+    """Chunk-local cumulative sum of gate values.
+
+    For each chunk of size *C*, computes:
+        G[t] = sum_{i=chunk_start(t)}^{t} g[i]
+
+    JAX equivalent of Triton ``chunk_local_cumsum`` / ``kda_gate_chunk_cumsum``.
+
+    Args:
+        g: [B, T, H, K] per-token log-space gate (output of ``fused_kda_gate``).
+        chunk_size: chunk width *C*.
+
+    Returns:
+        g_cumsum: [B, T, H, K] chunk-local cumulative sums.
+    """
+    B, T, H, K = g.shape
+    C = chunk_size
+    pad_len = (C - T % C) % C
+    if pad_len > 0:
+        g = jnp.pad(g, ((0, 0), (0, pad_len), (0, 0), (0, 0)))
+    T_pad = g.shape[1]
+    NT = T_pad // C
+    g_chunks = g.reshape(B, NT, C, H, K)
+    g_cumsum = jnp.cumsum(g_chunks, axis=2)
+    g_cumsum = g_cumsum.reshape(B, T_pad, H, K)
+    if pad_len > 0:
+        g_cumsum = g_cumsum[:, :T, :, :]
+    return g_cumsum
+
+
+def chunk_kda_intra(
+    q: Array,
+    k: Array,
+    v: Array,
+    g_cumsum: Array,
+    beta: Array,
+    scale: float,
+    chunk_size: int,
+) -> tuple[Array, Array, Array, Array]:
+    """Stage 1 – Intra-chunk computation.
+
+    Builds the causal attention matrix *Aqk* and solves the delta-rule
+    linear system to produce effective keys/values for inter-chunk
+    recurrence.
+
+    Corresponds to Triton ``chunk_kda_fwd_intra`` + ``recompute_w_u_fwd``.
+
+    Math (per chunk, per head)::
+
+        A_qk[i,j] = scale · <q_i·e^{G_i}, k_j·e^{-G_j}>       (i ≥ j)
+        A_kk[i,j] = β_i  · <k_i·e^{G_i}, k_j·e^{-G_j}>       (i > j)
+        w  = (I + strict_tril(A_kk))^{-1} @ (k · β · e^G)
+        u  = (I + strict_tril(A_kk))^{-1} @ (v · β)
+        kg = k · e^{G_last − G}
+
+    Args:
+        q: [B, T, H, K]
+        k: [B, T, H, K]
+        v: [B, T, H, V]
+        g_cumsum: [B, T, H, K] chunk-local cumulative gate.
+        beta: [B, T, H]
+        scale: float – attention scale (1/√K).
+        chunk_size: int
+
+    Returns:
+        w:   [B, T, H, K]        effective keys
+        u:   [B, T, H, V]        effective values
+        kg:  [B, T, H, K]        normalised keys for state update
+        Aqk: [B, NT, H, C, C]   intra-chunk causal attention
+    """
+    B, T, H, K = q.shape
+    V = v.shape[-1]
+    C = chunk_size
+
+    # --- pad to multiple of C ---
+    pad_len = (C - T % C) % C
+    if pad_len > 0:
+        q = jnp.pad(q, ((0, 0), (0, pad_len), (0, 0), (0, 0)))
+        k = jnp.pad(k, ((0, 0), (0, pad_len), (0, 0), (0, 0)))
+        v = jnp.pad(v, ((0, 0), (0, pad_len), (0, 0), (0, 0)))
+        g_cumsum = jnp.pad(g_cumsum, ((0, 0), (0, pad_len), (0, 0), (0, 0)))
+        beta = jnp.pad(beta, ((0, 0), (0, pad_len), (0, 0)))
+    T_pad = q.shape[1]
+    NT = T_pad // C
+
+    # reshape → [B, NT, C, H, ...]
+    q_c = q.reshape(B, NT, C, H, K)
+    k_c = k.reshape(B, NT, C, H, K)
+    v_c = v.reshape(B, NT, C, H, V)
+    g_c = g_cumsum.reshape(B, NT, C, H, K)
+    b_c = beta.reshape(B, NT, C, H)
+
+    # ---- numerically stable attention via *relative* gate diffs ----
+    # G_diff[i,j] = G[i] − G[j]  per dimension.
+    # For causal (i ≥ j): G_diff ≤ 0 because gates are negative ⇒ exp safe.
+    # Anti-causal entries are clamped to 0 before exp to prevent overflow.
+    G_diff = (g_c[:, :, :, None, :, :] -        # [B,NT, C, 1, H,K]
+              g_c[:, :, None, :, :, :])          # [B,NT, 1, C, H,K]
+    #  → [B, NT, C_i, C_j, H, K]
+
+    # --- Aqk  (lower-triangular including diagonal) ---
+    causal_mask = jnp.tril(jnp.ones((C, C), dtype=jnp.bool_))    # [C,C]
+    # clamp anti-causal diff to 0 → exp(0)=1, then zero by mask
+    G_diff_aqk = jnp.where(
+        causal_mask[None, None, :, :, None, None], G_diff, 0.0)
+    decay_aqk = (jnp.exp(G_diff_aqk)
+                 * causal_mask[None, None, :, :, None, None].astype(q.dtype))
+    Aqk = scale * jnp.einsum(
+        "bnihk,bnjhk,bnijhk->bnhij", q_c, k_c, decay_aqk)
+
+    # --- Akk  (strict lower-triangular) ---
+    strict_lower = jnp.tril(jnp.ones((C, C), dtype=jnp.bool_), k=-1)
+    G_diff_akk = jnp.where(
+        strict_lower[None, None, :, :, None, None], G_diff, 0.0)
+    decay_akk = (jnp.exp(G_diff_akk)
+                 * strict_lower[None, None, :, :, None, None].astype(q.dtype))
+    Akk_raw = jnp.einsum(
+        "bnihk,bnjhk,bnijhk->bnhij", k_c, k_c, decay_akk)  # [B,NT,H,C,C]
+    # broadcast β_i over col j:  [B,NT,C,H] → [B,NT,H,C,1]
+    beta_row = b_c.transpose(0, 1, 3, 2)[:, :, :, :, None]
+    Akk = Akk_raw * beta_row
+
+    # --- solve  (I + strict_tril(Akk)) @ x = rhs ---
+    Akk_tril = jnp.eye(C, dtype=q.dtype)[None, None, None, :, :] + Akk
+
+    # rhs for w:  k · β · exp(G)  (G ≤ 0 ⇒ exp(G) ∈ (0,1], safe)
+    k_decay = k_c * jnp.exp(g_c)                         # [B,NT,C,H,K]
+    k_beta_decay = (k_decay * b_c[:, :, :, :, None]).transpose(
+        0, 1, 3, 2, 4)                                   # [B,NT,H,C,K]
+    # rhs for u:  v · β
+    v_beta = (v_c * b_c[:, :, :, :, None]).transpose(
+        0, 1, 3, 2, 4)                                   # [B,NT,H,C,V]
+
+    w = jax.lax.linalg.triangular_solve(
+        Akk_tril, k_beta_decay, left_side=True, lower=True)   # [B,NT,H,C,K]
+    u = jax.lax.linalg.triangular_solve(
+        Akk_tril, v_beta, left_side=True, lower=True)         # [B,NT,H,C,V]
+
+    # --- kg: normalised keys for state update ---
+    g_last = g_c[:, :, -1:, :, :]                     # [B,NT,1,H,K]
+    kg = k_c * jnp.exp(g_last - g_c)                  # [B,NT,C,H,K]
+    kg = kg.transpose(0, 1, 3, 2, 4)                  # [B,NT,H,C,K]
+
+    # reshape back → [B, T_pad, H, ...] and trim
+    w  = w.transpose(0, 1, 3, 2, 4).reshape(B, T_pad, H, K)
+    u  = u.transpose(0, 1, 3, 2, 4).reshape(B, T_pad, H, V)
+    kg = kg.transpose(0, 1, 3, 2, 4).reshape(B, T_pad, H, K)
+    if pad_len > 0:
+        w  = w[:, :T]
+        u  = u[:, :T]
+        kg = kg[:, :T]
+    return w, u, kg, Aqk
+
+
+def chunk_kda_inter(
+    kg: Array,
+    w: Array,
+    u: Array,
+    g_cumsum: Array,
+    initial_state: Array | None,
+    output_final_state: bool,
+    chunk_size: int,
+) -> tuple[Array, Array, Array | None]:
+    """Stage 2 – Inter-chunk recurrence.
+
+    Scans over chunks, updating the RNN state with effective keys/values.
+
+    Corresponds to Triton ``chunk_gated_delta_rule_fwd_h``.
+
+    Per-chunk update::
+
+        h[c]      = state                         (save history)
+        pred      = w[c] @ state                  (project state)
+        v_new[c]  = u[c] − pred                   (delta residual)
+        state     = state · exp(G_last[c])
+                  + kg[c]ᵀ @ v_new[c]              (update)
+
+    Args:
+        kg: [B, T, H, K]
+        w:  [B, T, H, K]
+        u:  [B, T, H, V]
+        g_cumsum: [B, T, H, K]
+        initial_state: [B, H, K, V] or None
+        output_final_state: bool
+        chunk_size: int
+
+    Returns:
+        h_states:    [B, NT, H, K, V]  per-chunk starting states
+        v_new:       [B, T, H, V]      delta residuals
+        final_state: [B, H, K, V] or None
+    """
+    B, T, H, K = kg.shape
+    V = u.shape[-1]
+    C = chunk_size
+
+    pad_len = (C - T % C) % C
+    if pad_len > 0:
+        kg = jnp.pad(kg, ((0, 0), (0, pad_len), (0, 0), (0, 0)))
+        w  = jnp.pad(w,  ((0, 0), (0, pad_len), (0, 0), (0, 0)))
+        u  = jnp.pad(u,  ((0, 0), (0, pad_len), (0, 0), (0, 0)))
+        g_cumsum = jnp.pad(g_cumsum, ((0, 0), (0, pad_len), (0, 0), (0, 0)))
+    T_pad = kg.shape[1]
+    NT = T_pad // C
+
+    # [B,NT,C,H,K/V] → [B,NT,H,C,K/V]
+    kg_c = kg.reshape(B, NT, C, H, K).transpose(0, 1, 3, 2, 4)
+    w_c  = w.reshape(B, NT, C, H, K).transpose(0, 1, 3, 2, 4)
+    u_c  = u.reshape(B, NT, C, H, V).transpose(0, 1, 3, 2, 4)
+    g_c  = g_cumsum.reshape(B, NT, C, H, K).transpose(0, 1, 3, 2, 4)
+
+    # g_last per chunk: [B, NT, H, K]
+    g_last = g_c[:, :, :, -1, :]
+
+    state0 = (
+        initial_state.astype(jnp.float32)
+        if initial_state is not None
+        else jnp.zeros((B, H, K, V), dtype=jnp.float32)
+    )
+
+    def scan_fn(state, chunk_in):
+        """state: [B,H,K,V].  chunk_in: tensors for one chunk."""
+        kg_n, w_n, u_n, g_last_n = chunk_in
+        # kg_n:     [B,H,C,K]
+        # w_n:      [B,H,C,K]
+        # u_n:      [B,H,C,V]
+        # g_last_n: [B,H,K]
+
+        h = state                                        # save for output
+        pred = jnp.einsum("bhck,bhkv->bhcv", w_n, state) # [B,H,C,V]
+        v_new_n = u_n - pred                             # [B,H,C,V]
+
+        # decay + write
+        state = state * jnp.exp(g_last_n)[:, :, :, None] # [B,H,K,V]
+        state = state + jnp.einsum("bhck,bhcv->bhkv",
+                                   kg_n, v_new_n)        # [B,H,K,V]
+        return state, (h, v_new_n)
+
+    # scan expects leading axis = NT
+    scan_inputs = (
+        kg_c.transpose(1, 0, 2, 3, 4),     # [NT,B,H,C,K]
+        w_c.transpose(1, 0, 2, 3, 4),      # [NT,B,H,C,K]
+        u_c.transpose(1, 0, 2, 3, 4),      # [NT,B,H,C,V]
+        g_last.transpose(1, 0, 2, 3),      # [NT,B,H,K]
+    )
+    final_state, (h_all, v_new_all) = jax.lax.scan(
+        scan_fn, state0, scan_inputs)
+    # h_all:     [NT,B,H,K,V]
+    # v_new_all: [NT,B,H,C,V]
+
+    h_states = h_all.transpose(1, 0, 2, 3, 4)            # [B,NT,H,K,V]
+    v_new = v_new_all.transpose(1, 0, 2, 3, 4)           # [B,NT,H,C,V]
+    v_new = v_new.transpose(0, 1, 3, 2, 4).reshape(
+        B, T_pad, H, V)                                  # [B,T_pad,H,V]
+    if pad_len > 0:
+        v_new = v_new[:, :T]
+    if not output_final_state:
+        final_state = None
+    return h_states, v_new, final_state
+
+
+def chunk_kda_output(
+    q: Array,
+    g_cumsum: Array,
+    Aqk: Array,
+    h_states: Array,
+    v_new: Array,
+    scale: float,
+    chunk_size: int,
+) -> Array:
+    """Stage 3 – Output computation.
+
+    Combines inter-chunk (historical state query) and intra-chunk
+    (local attention) components.
+
+    Corresponds to Triton ``chunk_gla_fwd_o_gk``.
+
+    Math (per chunk c)::
+
+        qg       = q · e^G
+        o_inter  = scale · qg @ h[c]
+        o_intra  = Aqk @ v_new
+        o        = o_inter + o_intra
+
+    Args:
+        q: [B, T, H, K]  (NOT pre-scaled).
+        g_cumsum: [B, T, H, K]
+        Aqk: [B, NT, H, C, C]  (already includes *scale*).
+        h_states: [B, NT, H, K, V]
+        v_new: [B, T, H, V]
+        scale: float
+        chunk_size: int
+
+    Returns:
+        o: [B, T, H, V]
+    """
+    B, T, H, K = q.shape
+    V = v_new.shape[-1]
+    C = chunk_size
+
+    pad_len = (C - T % C) % C
+    if pad_len > 0:
+        q = jnp.pad(q, ((0, 0), (0, pad_len), (0, 0), (0, 0)))
+        g_cumsum = jnp.pad(g_cumsum, ((0, 0), (0, pad_len), (0, 0), (0, 0)))
+        v_new = jnp.pad(v_new, ((0, 0), (0, pad_len), (0, 0), (0, 0)))
+    T_pad = q.shape[1]
+    NT = T_pad // C
+
+    q_c = q.reshape(B, NT, C, H, K)
+    g_c = g_cumsum.reshape(B, NT, C, H, K)
+    v_new_c = v_new.reshape(B, NT, C, H, V)
+
+    # qg = q · exp(G)   →  [B,NT,H,C,K]
+    qg = (q_c * jnp.exp(g_c)).transpose(0, 1, 3, 2, 4)
+
+    # o_inter = scale · qg @ h  →  [B,NT,H,C,V]
+    o_inter = scale * jnp.einsum("bnhck,bnhkv->bnhcv", qg, h_states)
+
+    # o_intra = Aqk @ v_new    →  [B,NT,H,C,V]  (Aqk already contains scale)
+    v_new_t = v_new_c.transpose(0, 1, 3, 2, 4)          # [B,NT,H,C,V]
+    o_intra = jnp.einsum("bnhij,bnhjv->bnhiv", Aqk, v_new_t)
+
+    o = o_inter + o_intra                                # [B,NT,H,C,V]
+    o = o.transpose(0, 1, 3, 2, 4).reshape(B, T_pad, H, V)
+    if pad_len > 0:
+        o = o[:, :T]
+    return o
+
+
+def chunk_kda_reference(
+    q: Array, k: Array, v: Array, g: Array, beta: Array,
+    scale: float | None = None,
+    initial_state: Array | None = None,
+    output_final_state: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
+    use_gate_in_kernel: bool = False,
+    cu_seqlens: Array | None = None,
+    chunk_size: int = 64,
+    **kwargs: Any,
+) -> tuple[Array, Array | None]:
+    """Chunk-parallel KDA using 3-stage decomposition.
+
+    Structural alignment with Triton ``ChunkKDAFunction``::
+
+        Stage 0  – Gate cumsum + optional L2-norm     (preprocessing)
+        Stage 1  – Intra-chunk:  Aqk, solve → w, u, kg
+        Stage 2  – Inter-chunk:  scan over chunks     → h, v_new
+        Stage 3  – Output:       inter + intra        → o
+
+    For *varlen* (``cu_seqlens is not None``) this falls back to the
+    token-level recurrent reference to correctly handle sequence
+    boundaries that may fall inside a chunk.
+
+    Args:
+        q, k, v, g, beta: same shapes as ``_token_recurrent_kda``.
+        scale: 1/√K.  Defaults to ``q.shape[-1] ** -0.5``.
+        initial_state, output_final_state, use_qk_l2norm_in_kernel,
+        use_gate_in_kernel, cu_seqlens: same semantics.
+        chunk_size: chunk width (default 64, matching Triton).
+
+    Returns:
+        o: [B, T, H, V]
+        final_state: [B, H, K, V] or None
+    """
+    if use_gate_in_kernel:
+        raise ValueError("use_gate_in_kernel not supported in reference")
+
+    # --- varlen: fall back to token-level scan ---
+    if cu_seqlens is not None:
+        return _token_recurrent_kda(
+            q=q, k=k, v=v, g=g, beta=beta,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            cu_seqlens=cu_seqlens,
+        )
+
+    q = jnp.asarray(q, dtype=jnp.float32)
+    k = jnp.asarray(k, dtype=jnp.float32)
+    v = jnp.asarray(v, dtype=jnp.float32)
+    g = jnp.asarray(g, dtype=jnp.float32)
+    beta = jnp.asarray(beta, dtype=jnp.float32)
+
+    if scale is None:
+        scale = q.shape[-1] ** -0.5
+
+    # --- Stage 0: preprocessing ---
+    if use_qk_l2norm_in_kernel:
+        q = l2norm(q, dim=-1, eps=1e-6)
+        k = l2norm(k, dim=-1, eps=1e-6)
+
+    g_cumsum = chunk_local_cumsum(g, chunk_size)
+
+    # --- Stage 1: intra-chunk ---
+    w, u, kg, Aqk = chunk_kda_intra(
+        q=q, k=k, v=v, g_cumsum=g_cumsum, beta=beta,
+        scale=scale, chunk_size=chunk_size)
+
+    # --- Stage 2: inter-chunk recurrence ---
+    h_states, v_new, final_state = chunk_kda_inter(
+        kg=kg, w=w, u=u, g_cumsum=g_cumsum,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        chunk_size=chunk_size)
+
+    # --- Stage 3: output ---
+    o = chunk_kda_output(
+        q=q, g_cumsum=g_cumsum, Aqk=Aqk,
+        h_states=h_states, v_new=v_new,
+        scale=scale, chunk_size=chunk_size)
+
+    return o.astype(v.dtype), final_state
+
+
 def fused_recurrent_kda_reference(
     q: Array, k: Array, v: Array, g: Array, beta: Array,
     scale: float | None = None,
@@ -504,10 +941,10 @@ def fused_recurrent_kda_reference(
     cu_seqlens: Array | None = None,
     **kwargs: Any,
 ) -> tuple[Array, Array | None]:
-    """Reference fused_recurrent_kda using the recurrent formulation."""
+    """Reference fused_recurrent_kda using the token-level recurrence."""
     if use_gate_in_kernel:
         raise ValueError("use_gate_in_kernel not supported in reference")
-    return chunk_kda_reference(
+    return _token_recurrent_kda(
         q=q, k=k, v=v, g=g, beta=beta,
         scale=scale,
         initial_state=initial_state,
@@ -547,8 +984,10 @@ class KimiDeltaAttention(nnx.Module):
         expand_v: float = 1.0,
         head_dim: int = 128,
         num_heads: int = 16,
+        num_v_heads: int | None = None,
         mode: str = "chunk",
         use_short_conv: bool = True,
+        allow_neg_eigval: bool = False,
         conv_size: int = 4,
         conv_bias: bool = False,
         norm_eps: float = 1e-5,
@@ -561,19 +1000,47 @@ class KimiDeltaAttention(nnx.Module):
     ):
         assert expand_v == 1.0, "GVA not supported (expand_v must be 1.0)"
         assert mode in ("chunk", "fused_recurrent")
+        assert allow_neg_eigval is False, "allow_neg_eigval=True not supported in reference implementation"
+        assert num_v_heads is None
 
         self.hidden_size = hidden_size
+        self.expand_v = expand_v
+
         self.head_dim = head_dim
         self.num_heads = num_heads
+        self.num_v_heads = num_v_heads if num_v_heads is not None else num_heads
+
         self.head_k_dim = head_dim
         self.head_v_dim = int(head_dim * expand_v)
+
         self.key_dim = num_heads * self.head_k_dim
-        self.value_dim = num_heads * self.head_v_dim
+        self.value_dim = self.num_v_heads * self.head_v_dim
         self.mode = mode
+
         self.use_short_conv = use_short_conv
         self.conv_size = conv_size
+        self.conv_bias = conv_bias
+
+        self.allow_neg_eigval = allow_neg_eigval
         self.norm_eps = norm_eps
         self.dtype = dtype
+
+        if not math.isclose(self.num_v_heads * self.head_dim * expand_v, self.value_dim, rel_tol=1e-5):
+            raise ValueError(
+                f"expand_v={expand_v} does not produce an integer value when multiplied by key_dim={self.key_dim}. "
+                f"Resulting value_dim would be {self.num_v_heads * self.head_dim * expand_v}, which is invalid for nn.Linear.",
+            )
+
+        if self.num_v_heads > self.num_heads and self.num_v_heads % self.num_heads != 0:
+            raise ValueError(
+                f"num_v_heads={self.num_v_heads} must be divisible by num_heads={self.num_heads}.",
+            )
+
+        if not math.isclose(head_dim * expand_v, self.head_v_dim, rel_tol=1e-5):
+            raise ValueError(
+                f"expand_v={expand_v} does not produce an integer value when multiplied by head_dim={head_dim}. "
+                f"Resulting head_v_dim would be {head_dim * expand_v}, which is invalid for FusedRMSNormGated.",
+            )
 
         # --- Projections (aligned with fla) ---
         proj_kwargs = dict(dtype=dtype, weight_dtype=weight_dtype,
@@ -669,6 +1136,8 @@ class KimiDeltaAttention(nnx.Module):
         Returns:
             (o_out, new_cache, intermediates)
         """
+        # TODO(0xaskr) add attention_mask to cu_seqlens
+        # TODO(0xaskr) add use_cache support
         use_cache = output_final_state or cache is not None
         batch, q_len, _ = hidden_states.shape
 
