@@ -1,6 +1,7 @@
 import os
 import sys
 import functools
+import numpy as np
 # Add the fla directory to the path so we can import from the inner fla package
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), 'fla')))
 
@@ -10,6 +11,7 @@ os.environ["TRITON_INTERPRET"] = "1"
 # os.environ["JAX_PLATFORM_NAME"] = "cpu"
 
 import jax
+jax.config.update("jax_default_matmul_precision", "highest")
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
@@ -123,6 +125,8 @@ def chunk_gla_fwd_kernel_o(
   b_o *= scale
   b_v = v[pl.ds(bos+i_t* BT, BT), pl.ds(i_v * BV, BV)]
   b_A = A[pl.ds(bos+i_t* BT, BT), 0:BT]
+  # Apply causal mask
+  b_A = jnp.where(m_s, b_A, 0.0).astype(b_A.dtype)
   b_o += jnp.dot(b_A, b_v)
   o[pl.ds(bos+i_t* BT, BT), pl.ds(i_v * BV, BV)] = b_o.astype(o.dtype)
 
@@ -152,8 +156,7 @@ def chunk_gla_fwd_o_gk(
   assert g.shape == (B, T, H, K)
   assert A.shape == (B, T, H, BT)
   assert (cu_seqlens is None) or (cu_seqlens.shape == (N+1,))
-  assert (chunk_indices is None) or (chunk_indices.shape == (cdiv_pt(T,BT),2))
-  print("chunk_indices = ", chunk_indices)
+  # assert (chunk_indices is None) or (chunk_indices.shape == (cdiv_pt(T,BT),2))
   assert BK in [32, 64]
   assert BV in [64, 128]
   assert (cu_seqlens is None) or ((cu_seqlens is not None) and (chunk_indices is not None))
@@ -165,6 +168,33 @@ def chunk_gla_fwd_o_gk(
 
   # NT = 所有batch加在一起，chunk的数量
   NT = cdiv_pt(T, BT) if cu_seqlens is None else len(chunk_indices)
+
+  # Padding Logic for Varlen to prevent OOB access in Pallas Kernel
+  # The kernel reads fixed blocks of size BT. If the last chunk of a sequence
+  # starts near the end of T (e.g., index 224 for T=256 with BT=64),
+  # it will try to read up to 288. We must pad q, v, g, A.
+  # We pad by BT to be safe.
+  # Only apply padding if IS_VARLEN is true, as standard mode assumes perfect tiling or handles it differently.
+
+  orig_T = T
+  pad_len = 0
+  if IS_VARLEN:
+      pad_len = BT
+  else:
+      if T % BT != 0:
+          pad_len = cdiv_pt(T, BT) * BT - T
+
+  if pad_len > 0:
+      # Pad last dimension of T (axis 1)
+      # q: (B, T, H, K)
+      q = jnp.pad(q, ((0,0), (0, pad_len), (0,0), (0,0)))
+      v = jnp.pad(v, ((0,0), (0, pad_len), (0,0), (0,0)))
+      g = jnp.pad(g, ((0,0), (0, pad_len), (0,0), (0,0)))
+      # A: (B, T, H, BT)
+      A = jnp.pad(A, ((0,0), (0, pad_len), (0,0), (0,0)))
+      # Update T to reflect padded size for reshape inside kernel
+      T = T + pad_len
+
 
   assert h.shape == (B, NT, H, K, V)
 
@@ -194,6 +224,13 @@ def chunk_gla_fwd_o_gk(
   cs_blockspec = pl.BlockSpec([N+1], index_map=lambda v, nt, bh: (0,), memory_space=pltpu.MemorySpace.SMEM)
   ci_blockspec = pl.BlockSpec([NT, 2], index_map=lambda v, nt, bh: (0, 0,), memory_space=pltpu.MemorySpace.SMEM)
 
+  if cu_seqlens is None:
+      cu_seqlens_arg = jnp.zeros((N+1,), dtype=jnp.int32)
+      chunk_indices_arg = jnp.zeros((NT, 2), dtype=jnp.int32)
+  else:
+      cu_seqlens_arg = cu_seqlens
+      chunk_indices_arg = chunk_indices
+
   grid = (cdiv_pt(V, BV), NT, B * H)
   o = pl.pallas_call(
     functools.partial(
@@ -213,8 +250,14 @@ def chunk_gla_fwd_o_gk(
     out_shape=o_shape,
     out_specs=o_blockspec,
     in_specs=[q_blockspec, v_blockspec, g_blockspec, h_blockspec, A_blockspec,cs_blockspec, ci_blockspec],
-  )(q_t,v_t,g_t,h_t,A_t,cu_seqlens,chunk_indices)
+  )(q_t,v_t,g_t,h_t,A_t,cu_seqlens_arg,chunk_indices_arg)
 
+
+  o = o.transpose(1, 2, 0, 3)
+
+  if pad_len > 0:
+      # Slice back to original size
+      o = o[:, :orig_T, ...]
 
   return o
 
@@ -243,34 +286,35 @@ def test_fla_kda_shape():
   o_recurrent, _, _ = kda_recurrent(hidden_states)
   print("Output shape:", o_recurrent.shape)
 
-def test_chunk_gla_fwd_o_gk():
-  """直接测试 triton kernel chunk_gla_fwd_o_gk"""
-  B = 1          # batch size
-  T = 128        # sequence length
-  H = 4          # number of heads
-  K = 32         # head dim (key)
-  V = 32         # head dim (value)
-  chunk_size = 64
-  NT = T // chunk_size  # number of chunks
+def run_test_chunk_gla_fwd_o_gk(B, T, H, K, V, chunk_size, cu_seqlens_list, use_exp2):
+  print(f"\n=============================================")
+  print(f"Testing chunk_gla_fwd_o_gk")
+  print(f"B={B}, T={T}, H={H}, K={K}, V={V}, chunk_size={chunk_size}")
+  print(f"cu_seqlens={cu_seqlens_list}, use_exp2={use_exp2}")
+  print(f"=============================================")
 
-  # Cumulative Sequence Lengths
-  cu_seqlens = jnp.array([0, 32, 64], dtype=jnp.int32)
-
-  # chunk start index
-  chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
-  use_exp2 = True
+  if cu_seqlens_list is not None:
+    cu_seqlens = np.array(cu_seqlens_list, dtype=np.int32)
+    cu_seqlens_jax = jnp.array(cu_seqlens)
+    chunk_indices_jax = prepare_chunk_indices(cu_seqlens_jax, chunk_size)
+    NT = len(chunk_indices_jax)
+    cu_seqlens_pt = torch.LongTensor(cu_seqlens)
+  else:
+    cu_seqlens_jax = None
+    chunk_indices_jax = None
+    NT = cdiv_pt(T, chunk_size)
+    cu_seqlens_pt = None
 
   rng_dtype = torch.float32
-  pt_dtype = torch.float32
   jax_dtype = jnp.float32
   device = "cpu" if os.environ.get("TRITON_CPU_BACKEND", "0") == "1" else "cuda"
 
-  # 构造输入张量
   q = torch.randn(B, T, H, K, device=device, dtype=rng_dtype)
   v = torch.randn(B, T, H, V, device=device, dtype=rng_dtype)
   g_raw = torch.randn(B, T, H, K, device=device, dtype=rng_dtype) * 0.1
   g = g_raw.cumsum(dim=1)
-  A = torch.randn(B, T, H, chunk_size, device=device, dtype=rng_dtype)    # A: intra-chunk attention matrix [B, T, H, chunk_size]
+
+  A = torch.randn(B, T, H, chunk_size, device=device, dtype=rng_dtype)
   h = torch.randn(B, NT, H, K, V, device=device, dtype=rng_dtype) # h: inter-chunk hidden state [B, NT, H, K, V]
 
   scale = K ** -0.5
@@ -281,15 +325,8 @@ def test_chunk_gla_fwd_o_gk():
   h_jax = jnp.array(h.to(torch.float32), dtype = jax_dtype)
   A_jax = jnp.array(A.to(torch.float32), dtype = jax_dtype)
 
-
   o_jax = chunk_gla_fwd_o_gk(q_jax, v_jax, g_jax, A_jax, h_jax, scale,
-        cu_seqlens=cu_seqlens, chunk_size=chunk_size, chunk_indices=chunk_indices, use_exp2=use_exp2)
-  print(f"Testing chunk_gla_fwd_o_gk on {device}")
-  print(f"  B={B}, T={T}, H={H}, K={K}, V={V}, chunk_size={chunk_size}, NT={NT}")
-  print(f"  q: {q.shape}, v: {v.shape}, g: {g.shape}, A: {A.shape}, h: {h.shape}")
-  print(f"  scale={scale}")
-  print(f"  o_jax.shape={o_jax.shape}")
-  print("cu_seq device = ", cu_seqlens.device)
+        cu_seqlens=cu_seqlens_jax, chunk_size=chunk_size, chunk_indices=chunk_indices_jax, use_exp2=use_exp2)
 
   # 调用 triton kernel
   pt_o = fla_chunk_gla_fwd_o_gk(
@@ -299,18 +336,62 @@ def test_chunk_gla_fwd_o_gk():
       A=A,
       h=h,
       scale=scale,
+      cu_seqlens=cu_seqlens_pt,
       chunk_size=chunk_size,
+      use_exp2=use_exp2
   )
 
-  print(f"\nOutput shape: {pt_o.shape}")
-  assert pt_o.shape == (B, T, H, V), f"Expected shape {(B, T, H, V)}, got {pt_o.shape}"
-  print(f"Output dtype: {pt_o.dtype}")
-  print(f"Output mean: {pt_o.mean().item():.6f}, std: {pt_o.std().item():.6f}")
-  print(f"Output has NaN: {torch.isnan(pt_o).any().item()}")
-  print(f"Output has Inf: {torch.isinf(pt_o).any().item()}")
-  print("PASSED!")
+  o_jax_np = np.array(o_jax)
+  pt_o_np = pt_o.detach().cpu().numpy()
 
+  diff = np.abs(o_jax_np - pt_o_np)
+  max_diff = diff.max()
+  mean_diff = diff.mean()
+
+  print(f"Max Difference: {max_diff}")
+  print(f"Mean Difference: {mean_diff}")
+
+  if max_diff > 1e-4:
+      print("MISMATCH DETECTED!")
+      max_idx = np.unravel_index(np.argmax(diff, axis=None), diff.shape)
+      print(f"Max mismatch at index {max_idx}")
+      print(f"JAX value: {o_jax_np[max_idx]}")
+      print(f"Torch value: {pt_o_np[max_idx]}")
+      return False
+  else:
+      print("Results MATCH.")
+      return True
+
+def test_chunk_gla_fwd_o_gk_all():
+  test_cases = [
+      # Original case
+      dict(B=1, T=256, H=4, K=32, V=32, chunk_size=64, cu_seqlens_list=[0, 32, 256], use_exp2=True),
+      # Non-varlen mode (fixed length)
+      dict(B=2, T=256, H=4, K=32, V=32, chunk_size=64, cu_seqlens_list=None, use_exp2=True),
+      dict(B=2, T=128, H=4, K=64, V=64, chunk_size=32, cu_seqlens_list=None, use_exp2=False),
+      dict(B=1, T=64, H=2, K=64, V=128, chunk_size=64, cu_seqlens_list=None, use_exp2=True),
+      # Partial chunks standard mode
+      dict(B=2, T=100, H=2, K=32, V=64, chunk_size=32, cu_seqlens_list=None, use_exp2=False),
+      # Partial chunk varlen mode
+      dict(B=1, T=100, H=2, K=64, V=64, chunk_size=32, cu_seqlens_list=[0, 40, 100], use_exp2=True),
+      # Another varlen
+      dict(B=1, T=35, H=2, K=32, V=128, chunk_size=64, cu_seqlens_list=[0, 35], use_exp2=False),
+  ]
+  all_passed = True
+  for kwargs in test_cases:
+      try:
+          passed = run_test_chunk_gla_fwd_o_gk(**kwargs)
+      except Exception as e:
+          print(f"Exception during test: {e}")
+          passed = False
+      all_passed = all_passed and passed
+
+  if all_passed:
+      print("\nALL TESTS PASSED!")
+  else:
+      print("\nSOME TESTS FAILED!")
 
 if __name__ == "__main__":
   # test_fla_kda_shape()
-  test_chunk_gla_fwd_o_gk()
+  test_chunk_gla_fwd_o_gk_all()
+
